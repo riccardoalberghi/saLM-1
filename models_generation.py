@@ -5,6 +5,7 @@ this is models.py with additionally the test to generate answers for each model
 import torch
 from transformers import AutoTokenizer, AutoModel, AutoModelForCausalLM, AutoModelForSeq2SeqLM
 import gc
+from datasets import load_dataset
 
 # Define the set of domain-expert models with parameter count, task, and specialization
 MODELS = [
@@ -28,22 +29,23 @@ MODELS = [
         "prompt": "Solve this math problem: If x + 3 = 7, what is the value of x?"
     },
     {
-        # Biomedical (general purpose but good for specialized domains)
-        "name": "SmolLM-360M",
-        "parameters": 360_000_000,
-        "task": "General Language Tasks (with biomedical capabilities)",
-        "path": "HuggingFaceTB/SmolLM-360M",
+        # Biomedical
+        "name": "BioGPT-Large",
+        "parameters": 349_000_000,
+        "task": "Biomedical Generative Language Modeling",
+        "path": "microsoft/biogpt",
         "type": "causal",
-        "prompt": "Explain the function of antibodies in the immune system."
+        "prompt": "Summarize the latest findings on CRISPR-Cas9 gene editing."
     },
-        # Chemistry/Extraction
     {
-        "name": "NuExtract-tiny",
-        "parameters": 500_000_000,
-        "task": "Chemical Information Extraction",
-        "path": "numind/NuExtract-tiny"
-        "prompt": "Explain me the difference between a reduction and oxidation reaction"
-    }, 
+        # Chemistry
+        "name": "ChemGPT-19M",
+        "parameters": 19_000_000,
+        "task": "Generative Molecular Modeling",
+        "path": "ncfrey/ChemGPT-19M",
+        "type": "causal",
+        "prompt": "Generate three novel drug-like molecules as SELFIES."
+    }
 
     {
         # Physics
