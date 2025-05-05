@@ -50,7 +50,7 @@ def generate_answer(question: str, engines, chunk_size: int = CHUNK_SIZE, max_to
         params = SamplingParams(
             temperature=0.6,
             max_tokens=chunk_size,
-            stop_token_ids=[EOS_TOKEN_IDS[model_name]]
+            stop_token_ids=[EOS_TOKEN_IDS[model_name]],
             skip_special_tokens=False,
         )
         
