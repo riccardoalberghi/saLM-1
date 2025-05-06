@@ -30,14 +30,6 @@ MODELS = [
         "prompt": "Write a function to solve the Tower of Hanoi."
     },
     {
-        "name": "GPT‑Neo‑125M‑Medical‑QA",
-        "parameters": 125_000_000,
-        "task": "Medical question answering",
-        "path": "faclorxin152/gpt-neo-125m-medical-qa",
-        "type": "causal",
-        "prompt": "What are the symptoms of Type 2 diabetes?"
-    },
-    {
         "name": "GPT‑Neo‑Math‑Small",
         "parameters": 125_000_000,
         "task": "Proof‑step generation (Lean tactics)",
