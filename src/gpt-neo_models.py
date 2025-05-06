@@ -70,14 +70,6 @@ MODELS = [
         "type": "causal",
         "prompt": "Analyze the causes and consequences of the Industrial Revolution."
     },
-    {
-        "name": "GPT‑Neo‑125M‑IndicFinGPT",
-        "parameters": 125_000_000,
-        "task": "Financial market analysis",
-        "path": "bhaskartripathi/GPT_Neo_Market_Analysis",
-        "type": "causal",
-        "prompt": "[INST] Given the following stock market data and technical indicators, provide a risk‑adjusted trading recommendation for tomorrow:[/INST]"
-    }
 ]
 
 
