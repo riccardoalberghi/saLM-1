@@ -7,12 +7,13 @@ from itertools import cycle
 from datasets import load_dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import torch
-import tqdm
+from tqdm import tqdm
+import logging
 
 # Model identifiers
 MODELS = [
     "Qwen/Qwen2.5-0.5B",  # Small model
-    "likewendy/Qwen2.5-3B-sex-GPRO-float16",  # Larger model
+    "Qwen/Qwen2.5-3B",  # Larger model
 ]
 
 # Number of tokens to generate per model before switching
@@ -33,26 +34,46 @@ def initialize_tokenizers():
             tokenizer = AutoTokenizer.from_pretrained(model_name)
             MODEL_TOKENIZERS[model_name] = tokenizer
             EOS_TOKEN_IDS[model_name] = tokenizer.eos_token_id
-            print(f"Model {model_name} EOS token ID: {tokenizer.eos_token_id}")
+            logging.debug(f"Model {model_name} EOS token ID: {tokenizer.eos_token_id}")
         except Exception as e:
-            print(f"Error loading tokenizer for {model_name}: {e}")
+            logging.debug(f"Error loading tokenizer for {model_name}: {e}")
 
 def initialize_models():
     """Initialize models for all specified model names"""
     for model_name in MODELS:
-        print(f"Loading model {model_name}...")
+        logging.debug(f"Loading model {model_name}...")
         try:
-            # Fix - specify CPU explicitly instead of "auto" to avoid SafeTensors error
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            model = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                device_map=device,  # Use explicit device instead of "auto"
-                torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32
-            )
+            # Check if MPS is available (Apple Metal)
+            if torch.backends.mps.is_available():
+                device = "mps"
+                logging.debug(f"Using Apple Metal (MPS) for {model_name}")
+                model = AutoModelForCausalLM.from_pretrained(
+                    model_name,
+                    torch_dtype=torch.float16
+                )
+                model = model.to(device)
+            # Check if CUDA is available
+            elif torch.cuda.is_available():
+                device = "cuda"
+                logging.debug(f"Using CUDA for {model_name}")
+                model = AutoModelForCausalLM.from_pretrained(
+                    model_name,
+                    device_map=device,
+                    torch_dtype=torch.float16
+                )
+            # Fall back to CPU
+            else:
+                device = "cpu"
+                logging.debug(f"Using CPU for {model_name}")
+                model = AutoModelForCausalLM.from_pretrained(
+                    model_name,
+                    torch_dtype=torch.float32
+                )
+                
             MODEL_INSTANCES[model_name] = model
-            print(f"Successfully loaded {model_name}")
+            logging.debug(f"Successfully loaded {model_name} on {device}")
         except Exception as e:
-            print(f"Error loading model {model_name}: {e}")
+            logging.debug(f"Error loading model {model_name}: {e}")
 
 def generate_answer_alternating(question: str, chunk_size: int = CHUNK_SIZE, max_tokens: int = MAX_TOKENS) -> str:
     """
@@ -69,14 +90,16 @@ def generate_answer_alternating(question: str, chunk_size: int = CHUNK_SIZE, max
         model = MODEL_INSTANCES[model_name]
         tokenizer = MODEL_TOKENIZERS[model_name]
         
-        print(f"Using {model_name}...")
+        logging.debug(f"Using {model_name}...")
         
         try:
             # Tokenize the full prompt + generated text so far
             inputs = tokenizer(prompt + generated, return_tensors="pt")
             
-            # Move to GPU if available
-            if torch.cuda.is_available():
+            # Move inputs to the appropriate device
+            if torch.backends.mps.is_available():
+                inputs = {k: v.to("mps") for k, v in inputs.items()}
+            elif torch.cuda.is_available():
                 inputs = {k: v.cuda() for k, v in inputs.items()}
             
             # Generate next chunk
@@ -89,16 +112,17 @@ def generate_answer_alternating(question: str, chunk_size: int = CHUNK_SIZE, max
             )
             
             # Get only the newly generated tokens
-            new_tokens = outputs[0, inputs.input_ids.shape[1]:]
+            new_tokens = outputs[0, inputs['input_ids'].shape[1]:]
             
-            # Check for EOS token
-            if tokenizer.eos_token_id in new_tokens:
-                eos_idx = (new_tokens == tokenizer.eos_token_id).nonzero(as_tuple=True)[0][0]
+            # Check for EOS token for the current model
+            current_eos_token_id = tokenizer.eos_token_id
+            if current_eos_token_id in new_tokens:
+                eos_idx = (new_tokens == current_eos_token_id).nonzero(as_tuple=True)[0][0]
                 new_tokens = new_tokens[:eos_idx]
                 
                 new_text = tokenizer.decode(new_tokens, skip_special_tokens=True)
                 generated += new_text
-                print(f"EOS token encountered, stopping generation")
+                logging.debug(f"EOS token {current_eos_token_id} encountered for {model_name}, stopping generation")
                 break
             
             # Decode and add to generated text
@@ -114,7 +138,7 @@ def generate_answer_alternating(question: str, chunk_size: int = CHUNK_SIZE, max
             current_model_idx = (current_model_idx + 1) % len(MODELS)
             
         except Exception as e:
-            print(f"Error with {model_name}: {e}")
+            logging.debug(f"Error with {model_name}: {e}")
             # Switch to the next model
             current_model_idx = (current_model_idx + 1) % len(MODELS)
     
@@ -128,6 +152,7 @@ def generate_answer_single_model(question: str, model_name: str, max_tokens: int
     Generate an answer using a single model.
     """
     # Make the prompt more explicit to encourage generation
+    logging.debug(f"Generating answer with {model_name}...\n")
     prompt = question + "\nAnswer:"
     
     model = MODEL_INSTANCES[model_name]
@@ -137,8 +162,10 @@ def generate_answer_single_model(question: str, model_name: str, max_tokens: int
         # Tokenize the prompt
         inputs = tokenizer(prompt, return_tensors="pt")
         
-        # Move to GPU if available
-        if torch.cuda.is_available():
+        # Move to appropriate device
+        if torch.backends.mps.is_available():
+            inputs = {k: v.to("mps") for k, v in inputs.items()}
+        elif torch.cuda.is_available():
             inputs = {k: v.cuda() for k, v in inputs.items()}
         
         # Generate answer in one go
@@ -147,16 +174,16 @@ def generate_answer_single_model(question: str, model_name: str, max_tokens: int
             max_new_tokens=max_tokens,
             temperature=0.6,
             do_sample=True,
-            pad_token_id=tokenizer.eos_token_id
+            pad_token_id=EOS_TOKEN_IDS[model_name]
         )
         
         # Decode only the generated portion (skip the prompt)
-        generated = tokenizer.decode(outputs[0, inputs.input_ids.shape[1]:], skip_special_tokens=True)
+        generated = tokenizer.decode(outputs[0, inputs['input_ids'].shape[1]:], skip_special_tokens=True)
         
         return generated.strip()
         
     except Exception as e:
-        print(f"Error with {model_name}: {e}")
+        logging.debug(f"Error with {model_name}: {e}")
         return f"Error generating answer with {model_name}."
 
 def extract_answer(text: str):
@@ -210,8 +237,8 @@ def evaluate_models(dataset, num_samples, output_dir="results"):
         if not question:
             continue
             
-        print(f"\n[{idx+1}/{len(dataset)}] Question:")
-        print(question)
+        logging.debug(f"\n[{idx+1}/{len(dataset)}] Question:")
+        logging.debug(question)
         
         # Generate answers with each approach
         answers = {
@@ -237,10 +264,10 @@ def evaluate_models(dataset, num_samples, output_dir="results"):
                 "correct": is_correct
             })
             
-            print(f"{results[approach]['name']} Answer:")
-            print(answer)
-            print(f"Correct: {is_correct}")
-            print("-" * 30)
+            logging.debug(f"{results[approach]['name']} Answer:")
+            logging.debug(answer)
+            logging.debug(f"Correct: {is_correct}")
+            logging.debug("-" * 30)
     
     # Calculate accuracy for each approach
     for approach in results.keys():
@@ -280,15 +307,27 @@ def main():
     parser.add_argument("--split", type=str, default="test", help="Dataset split")
     parser.add_argument("--samples", type=int, default=20, help="Number of samples to evaluate")
     parser.add_argument("--output", type=str, default="results", help="Output directory")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     
     args = parser.parse_args()
+
+    # Set up logging
+    if args.debug:
+        logging.basicConfig(level=logging.DEBUG)
     
-    print(f"CUDA available: {torch.cuda.is_available()}")
-    if torch.cuda.is_available():
-        print(f"GPU: {torch.cuda.get_device_name(0)}")
+    # Check for MPS (Metal) availability
+    if torch.backends.mps.is_available():
+        print(f"MPS (Apple Metal) available: {torch.backends.mps.is_available()}")
+        logging.debug(f"MPS (Apple Metal) is built: {torch.backends.mps.is_built()}")
+    # Check for CUDA availability
+    elif torch.cuda.is_available():
+        print(f"CUDA available: {torch.cuda.is_available()}")
+        logging.debug(f"GPU: {torch.cuda.get_device_name(0)}")
+    else:
+        print("Using CPU - no GPU acceleration available")
     
     # Load dataset
-    print(f"Loading {args.dataset} dataset...")
+    logging.debug(f"Loading {args.dataset} dataset...")
     dataset = load_dataset(args.dataset, args.config, split=args.split)
     print(f"Loaded {len(dataset)} examples.")
     
@@ -300,7 +339,7 @@ def main():
     initialize_models()
     
     # Run evaluation
-    print(f"Running evaluation on {args.samples} examples...")
+    logging.debug(f"Running evaluation on {args.samples} examples...")
     results = evaluate_models(dataset, args.samples, args.output)
     
     print(f"Evaluation complete. Results saved to {args.output} directory.")
