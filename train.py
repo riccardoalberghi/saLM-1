@@ -10,6 +10,7 @@ from typing import List, Dict, Optional, Tuple
 import os
 import random
 import numpy as np
+from datasets import load_dataset
 
 from src.architecture import MultiModelWithScalarHeads
 from src.loss_functions import weighted_token_cross_entropy
@@ -29,41 +30,80 @@ def set_seed(seed: int = 42):
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    
-# Placeholder dataset class - replace with your actual dataset
-class PlaceholderDataset(Dataset):
-    def __init__(self, tokenizer, max_length=128):
+
+class BalancedFinetuningDataset(Dataset):
+    """Dataset that combines multiple HuggingFace finetuning datasets and balances them."""
+
+    def __init__(
+        self,
+        repo_names: List[str],
+        tokenizer,
+        split: str = "train",
+        max_length: int = 128,
+        shuffle: bool = True,
+        seed: int = 42,
+    ):
         self.tokenizer = tokenizer
         self.max_length = max_length
-        self.data = [
-            {"input": "This is a sample input", "target": "This is a sample target"}
-        ] * 100  # Just repeating the same sample 100 times as a placeholder
-        
+        self.examples: List[Tuple[str, str]] = []
+        random.seed(seed)
+
+        datasets_list = []
+        for repo in repo_names:
+            try:
+                ds = load_dataset(repo, split=split)
+                datasets_list.append(ds)
+                logger.info(f"Loaded dataset {repo} with {len(ds)} {split} samples")
+            except Exception as e:
+                logger.warning(f"Failed to load dataset {repo}: {e}")
+
+        if not datasets_list:
+            raise ValueError("No datasets could be loaded. Please check dataset names.")
+
+        # Balance by trimming each dataset to the smallest size
+        min_size = min(len(ds) for ds in datasets_list)
+        logger.info(f"Balancing datasets to smallest size: {min_size} samples each")
+
+        for ds in datasets_list:
+            indices = list(range(len(ds)))
+            if shuffle:
+                random.shuffle(indices)
+            for i in indices[:min_size]:
+                item = ds[i]
+                # Common schema handling
+                if "input" in item and "target" in item:
+                    self.examples.append((item["input"], item["target"]))
+                elif "question" in item and "answer" in item:
+                    self.examples.append((item["question"], item["answer"]))
+                elif "text" in item and "label" in item:
+                    self.examples.append((item["text"], str(item["label"])))
+                else:
+                    # Skip unsupported schema items
+                    continue
+
+        if shuffle:
+            random.shuffle(self.examples)
+
     def __len__(self):
-        return len(self.data)
-    
+        return len(self.examples)
+
     def __getitem__(self, idx):
-        item = self.data[idx]
-        input_text = item["input"]
-        target_text = item["target"]
-        
-        # Tokenize input and target
+        input_text, target_text = self.examples[idx]
+
         input_encoding = self.tokenizer(
-            input_text, 
-            max_length=self.max_length, 
-            padding='max_length', 
+            input_text,
+            max_length=self.max_length,
+            padding="max_length",
             truncation=True,
-            return_tensors="pt"
+            return_tensors="pt",
         )
-        
         target_encoding = self.tokenizer(
-            target_text, 
-            max_length=self.max_length, 
-            padding='max_length', 
+            target_text,
+            max_length=self.max_length,
+            padding="max_length",
             truncation=True,
-            return_tensors="pt"
+            return_tensors="pt",
         )
-        
         return {
             "input_ids": input_encoding["input_ids"].squeeze(),
             "attention_mask": input_encoding["attention_mask"].squeeze(),
@@ -229,6 +269,13 @@ def main():
     parser.add_argument("--head_dropout", type=float, default=0.1, help="Dropout rate for projection heads")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--device", type=str, default=None, help="Device to use (cuda, cpu, mps). If None, will use best available.")
+    parser.add_argument(
+        "--datasets",
+        type=str,
+        nargs='+',
+        required=True,
+        help="List of HuggingFace dataset repository names for finetuning."
+    )
     
     args = parser.parse_args()
     
@@ -268,9 +315,19 @@ def main():
     tokenizer = model.tokenizers[first_model_id]
     
     # Create dataset and dataloaders
-    # Replace with your actual dataset implementation
-    train_dataset = PlaceholderDataset(tokenizer, max_length=args.max_length)
-    val_dataset = PlaceholderDataset(tokenizer, max_length=args.max_length)
+    # Build balanced finetuning dataset
+    train_dataset = BalancedFinetuningDataset(
+        args.datasets,
+        tokenizer,
+        max_length=args.max_length,
+        split="train",
+    )
+    val_dataset = BalancedFinetuningDataset(
+        args.datasets,
+        tokenizer,
+        max_length=args.max_length,
+        split="validation",
+    )
     
     train_dataloader = DataLoader(
         train_dataset,
