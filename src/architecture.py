@@ -50,6 +50,12 @@ class MultiModelWithScalarHeads(nn.Module):
         self.base_models = {}
         self.tokenizers = {}
         self.model_ids = []
+
+            # Store the device
+        self.device = device if device is not None else ('cuda' if torch.cuda.is_available() else 'cpu')
+        
+        self.model_loader = model_loader if model_loader else ModelLoader(self.device)
+
         
         # Load all models 
         for model_info in base_models:
@@ -58,6 +64,10 @@ class MultiModelWithScalarHeads(nn.Module):
             self.base_models[model_id] = model
             self.tokenizers[model_id] = tokenizer
             self.model_ids.append(model_id)
+
+            # Set padding token for each tokenizer if missing
+            if tokenizer.pad_token is None:
+                tokenizer.pad_token = tokenizer.eos_token
         
         # Check that all models have the same hidden size
         hidden_sizes = [model.config.hidden_size for model in self.base_models.values()]
@@ -74,7 +84,10 @@ class MultiModelWithScalarHeads(nn.Module):
                 input_dim=self.hidden_size,
                 hidden_dim=head_hidden_dim,
                 dropout=head_dropout
-            )
+            ).to(self.device)
+
+        # Move the entire model to the device
+        self.to(self.device)    
     
     def forward(self, input_texts: List[str]) -> Dict[str, torch.Tensor]:
         """
@@ -107,18 +120,29 @@ class MultiModelWithScalarHeads(nn.Module):
                 logits = outputs.logits
                 token_logits[model_id] = logits
                 
-                # Get the last token's representation from the last layer
-                last_hidden_state = outputs.hidden_states[-1]
-                last_token_representation = last_hidden_state[:, -1, :]
+                # Get all token representations from the last layer
+                last_hidden_state = outputs.hidden_states[-1].to(self.device)
+
+                # Process each token position
+                batch_size, seq_len, _ = last_hidden_state.shape
+                position_scores = torch.zeros(batch_size, seq_len, device=self.device)
                 
-                # Store hidden state
-                hidden_states[model_id] = last_token_representation
+                for pos in range(seq_len):
+                    # Get representation for this position
+                    token_representation = last_hidden_state[:, pos, :]
+                    
+                    # Apply projection head
+                    position_scores[:, pos] = self.projection_heads[model_id](token_representation).squeeze(-1)
                 
-                # Apply the model-specific projection head
-                raw_model_scores[model_id] = self.projection_heads[model_id](last_token_representation)
+                # Store token-level scores
+                raw_model_scores[model_id] = position_scores
         
-        # Stack all raw scores into a single tensor
-        all_raw_model_scores = torch.cat([raw_model_scores[model_id] for model_id in self.model_ids], dim=1)
+        # Stack all raw scores into a single tensor [batch_size, seq_len, num_models]
+        all_raw_model_scores = torch.stack(
+            [raw_model_scores[model_id] for model_id in self.model_ids], 
+            dim=-1
+        )
+                
         
         # Return results
         return {
@@ -131,39 +155,75 @@ class MultiModelWithScalarHeads(nn.Module):
     
     def get_model_probs(self, all_raw_scores: torch.Tensor) -> torch.Tensor:
         """Convert raw scores to model probabilities using softmax."""
-        return torch.softmax(all_raw_scores, dim=1)
-    
+        return torch.softmax(all_raw_scores, dim=-1)
+  
     def get_token_probs(self, token_logits: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        """Convert token logits to token probabilities using softmax."""
-        return {model_id: torch.softmax(logits, dim=-1) 
-                for model_id, logits in token_logits.items()}
+        """Convert token logits to token probabilities using softmax, ensuring unified vocab size."""
+        # First, find the maximum vocabulary size across all models
+        max_vocab_size = max(logits.size(-1) for logits in token_logits.values())
+        
+        # Convert logits to probabilities and pad if necessary
+        token_probs = {}
+        for model_id, logits in token_logits.items():
+            # Apply softmax to convert logits to probabilities
+            probs = torch.softmax(logits, dim=-1)
+            
+            # Check if we need to pad
+            current_vocab_size = probs.size(-1)
+            if current_vocab_size < max_vocab_size:
+                # Create zero padding tensor
+                padding = torch.zeros(
+                    probs.size(0),  # batch size
+                    probs.size(1),  # sequence length
+                    max_vocab_size - current_vocab_size,  # padding width
+                    device=probs.device
+                )
+                
+                # Concatenate the padding with the probabilities
+                probs = torch.cat([probs, padding], dim=-1)
+                
+            token_probs[model_id] = probs
+        
+        return token_probs 
     
     def get_combined_token_probs(self, token_logits: Dict[str, torch.Tensor], model_probs: torch.Tensor) -> torch.Tensor:
         """Get token probabilities weighted by model probabilities"""
-        # ASSUMING SAME VOCAB FOR ALL MODELS, THIS MIGHT NOT BE TRUE
-
         # Convert logits to probabilities
         token_probs = self.get_token_probs(token_logits)
         
-        # Initialize combined probabilities
-        combined_probs = None
+        # Get dimensions from the first model's token probabilities
+        first_model_id = self.model_ids[0]
+        batch_size, seq_len, vocab_size = token_probs[first_model_id].shape
         
-        # Weight and combine token probabilities
-        for i, model_id in enumerate(self.model_ids):
-            # Get weight for this model [batch_size, 1, 1]
-            weight = model_probs[:, i:i+1, None]
-            
-            # Weight the token probabilities
-            weighted_probs = weight * token_probs[model_id]
-            
-            # Add to combined probabilities
-            if combined_probs is None:
-                combined_probs = weighted_probs
-            else:
-                combined_probs += weighted_probs
+        # Initialize combined probabilities
+        combined_probs = torch.zeros(batch_size, seq_len, vocab_size, device=self.device)
+        
+        # Check if we have token-level routing
+        if model_probs.dim() == 3:  # [batch_size, seq_len, num_models]
+            # Token-level routing
+            for i, model_id in enumerate(self.model_ids):
+                # Get weight for this model at each position [batch_size, seq_len, 1]
+                weight = model_probs[:, :, i].unsqueeze(-1)
                 
+                # Weight the token probabilities
+                weighted_probs = weight * token_probs[model_id]
+                
+                # Add to combined probabilities
+                combined_probs += weighted_probs
+        else:  # [batch_size, num_models]
+            # Original sequence-level routing behavior
+            for i, model_id in enumerate(self.model_ids):
+                # Get weight for this model [batch_size, 1, 1]
+                weight = model_probs[:, i].unsqueeze(-1).unsqueeze(-1)
+                
+                # Weight the token probabilities
+                weighted_probs = weight * token_probs[model_id]
+                
+                # Add to combined probabilities
+                combined_probs += weighted_probs
+        
         return combined_probs
-    
+        
     def __del__(self):
         """Clean up resources when the model is deleted."""
         try:

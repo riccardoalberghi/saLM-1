@@ -3,70 +3,96 @@ import torch.nn.functional as F
 from typing import List, Dict
 
 def weighted_token_cross_entropy(
-    token_probs_dict: Dict[str, torch.Tensor],  # Dict of model token probabilities
-    model_probs: torch.Tensor,                  # Probability distribution over models
-    target_tokens: torch.Tensor,                # Target token indices
-    model_ids: List[str],                       # Model IDs in order   
-    entropy_weight: float = 0.1,                # Weight for model probabilities entropy                               
-    pad_token_id: int = 0                       # ID to ignore (padding)
+    token_probs_dict: Dict[str, torch.Tensor],
+    model_probs: torch.Tensor,  # [batch_size, seq_len, num_models]
+    target_tokens: torch.Tensor,
+    model_ids: List[str],
+    entropy_weight: float = 0.1,
+    pad_token_id: int = 0
 ) -> torch.Tensor:
     """
-    Compute cross entropy between weighted token probabilities and targets.
-    
-    This function:
-    1. Computes a weighted average of token probabilities across models
-    2. Calculates cross entropy between this weighted distribution and target tokens
+    Calculate weighted token cross-entropy loss with token-level routing.
     
     Args:
-        token_probs_dict: Dictionary mapping model_id to token probabilities
-                         Each tensor has shape [batch_size, seq_len, vocab_size]
-        model_probs: Probability distribution over models [batch_size, num_models]
-        target_tokens: Target token indices [batch_size, seq_len]
-        model_ids: List of model IDs corresponding to order in model_probs
-        pad_token_id: Token ID to ignore in loss calculation (usually padding)
+        token_probs_dict: Dictionary of token probabilities for each model
+                         [batch_size, seq_len, vocab_size]
+        model_probs: Probabilities for each model at each token position
+                    [batch_size, seq_len, num_models]
+        target_tokens: Target token IDs [batch_size, seq_len]
+        model_ids: List of model IDs
+        entropy_weight: Weight for entropy regularization
+        pad_token_id: Token ID for padding
         
     Returns:
-        Cross entropy loss averaged over non-padding positions
+        Weighted cross-entropy loss
     """
-    batch_size = model_probs.shape[0]
+    # Verify dimensions
+    assert model_probs.dim() == 3, "model_probs must be 3D: [batch_size, seq_len, num_models]"
     
-    # Initialize the weighted token probability distribution
-    first_model_id = model_ids[0]
-    seq_len = token_probs_dict[first_model_id].shape[1]
-    vocab_size = token_probs_dict[first_model_id].shape[2]
-    device = token_probs_dict[first_model_id].device
+    batch_size, seq_len, num_models = model_probs.shape
+    vocab_size = next(iter(token_probs_dict.values())).size(-1)
     
-    # Initialize weighted token probabilities
-    weighted_probs = torch.zeros(batch_size, seq_len, vocab_size, device=device)
+    # Assert consistent sequence lengths
+    assert target_tokens.size(1) >= seq_len, "target_tokens sequence length too short"
+    for model_id in model_ids:
+        assert token_probs_dict[model_id].size(1) >= seq_len, f"token_probs for {model_id} sequence length too short"
     
-    # Compute weighted average of token probabilities
+    # Use only the required sequence length from target
+    target_tokens = target_tokens[:, :seq_len]
+    
+    # Initialize tensor for combined probabilities
+    combined_probs = torch.zeros(batch_size, seq_len, vocab_size, device=target_tokens.device, requires_grad=True)
+    
+    # Combine token probabilities with position-specific model weights
     for i, model_id in enumerate(model_ids):
-        # Get model weight [batch_size, 1, 1]
-        model_weight = model_probs[:, i:i+1, None]
+        # Get weights for this model at each position [batch_size, seq_len, 1]
+        model_weight = model_probs[:, :, i].unsqueeze(-1)
         
-        # Get token probabilities for this model [batch_size, seq_len, vocab_size]
-        token_probs = token_probs_dict[model_id]
+        # Only use required sequence length
+        token_probs = token_probs_dict[model_id][:, :seq_len]
         
-        # Weight and add to combined probabilities
-        weighted_probs += model_weight * token_probs
+        # Weight each model's token probabilities by its position-specific weight
+        combined_probs = combined_probs + model_weight * token_probs
     
-    # Reshape for cross entropy
-    flat_probs = weighted_probs.view(-1, vocab_size)  # [batch_size*seq_len, vocab_size]
-    flat_targets = target_tokens.view(-1)             # [batch_size*seq_len]
+    # Reshape for cross entropy calculation
+    # From [batch_size, seq_len, vocab_size] to [batch_size * seq_len, vocab_size]
+    combined_probs_flat = combined_probs.reshape(-1, vocab_size)
     
-    # Create mask for non-padding positions
-    mask = (flat_targets != pad_token_id)
+    # Reshape target tokens from [batch_size, seq_len] to [batch_size * seq_len]
+    target_flat = target_tokens.reshape(-1)
     
-    per_token_loss = F.cross_entropy(
-        flat_probs, 
-        flat_targets,
-        reduction='none'  
-    )
+    # Create mask for non-padding tokens
+    non_pad_mask = (target_flat != pad_token_id)
     
-    masked_loss = per_token_loss * mask.float()
-    num_tokens = mask.sum().float().clamp(min=1.0) 
-
-    model_probs_entropy = -(model_probs * torch.log(model_probs + 1e-10)).sum(dim=-1).mean()
+    # Only calculate loss on non-padding tokens
+    if non_pad_mask.sum() > 0:
+        # Filter out padding tokens
+        # Use indexing that preserves gradients
+        valid_indices = torch.nonzero(non_pad_mask).squeeze()
+        combined_probs_non_pad = combined_probs_flat.index_select(0, valid_indices)
+        target_non_pad = target_flat.index_select(0, valid_indices)
+        
+        # Ensure target indices are valid
+        max_index = vocab_size - 1
+        target_non_pad = torch.clamp(target_non_pad, 0, max_index)
+        
+        # Calculate cross entropy loss
+        token_loss = F.cross_entropy(
+            combined_probs_non_pad,
+            target_non_pad,
+            reduction='mean'
+        )
+    else:
+        # If all tokens are padding, return zero loss
+        # Use a tensor connected to the graph
+        token_loss = torch.sum(combined_probs) * 0.0
     
-    return masked_loss.sum() / num_tokens + entropy_weight * model_probs_entropy
+    # Add entropy regularization - encourage diversity in model selection
+    # Calculate entropy at each token position and average
+    entropy = -torch.sum(model_probs * torch.log(model_probs + 1e-10), dim=2).mean()
+    
+    # Subtract entropy (with weight) from loss to encourage diverse model usage
+    total_loss = token_loss - entropy_weight * entropy
+    
+    return total_loss
 
