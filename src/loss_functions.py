@@ -95,4 +95,3 @@ def weighted_token_cross_entropy(
     total_loss = token_loss - entropy_weight * entropy
     
     return total_loss
-
