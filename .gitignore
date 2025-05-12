@@ -1,3 +1,6 @@
 myvenv/
 results/
 *.sh
+requirements.txt
+*.pyc
+__pycache__/
