@@ -1,0 +1,39 @@
+[
+    {
+        "model_name": "GPT‑Neo‑125M (General)",
+        "training_data_0": "EleutherAI/the_pile_deduplicated",
+        "test_data_0": "allenai/winogrande",
+        "test_data_1": "ybisk/piqa",
+        "test_data_2": "Rowan/hellaswag",
+        "test_data_3": "LSDSem/story_cloze",
+        "test_data_4": "google/boolq",
+        "test_data_5": "allenai/openbookqa",
+        "paper_0": "https://arxiv.org/pdf/2211.15593"
+    },
+    {
+        "model_name": "GPT‑Neo‑125M‑Code‑Clippy",
+        "training_data_0": "https://the-eye.eu/public/AI/training_data/code_clippy_data/code_clippy_dedup_data/",
+        "test_data_0": "openai/openai_humaneval",
+        "paper_0": "https://github.com/CodedotAl/gpt-code-clippy"
+    },
+    {
+        "model_name": "GPT‑Neo‑125M‑APPS",
+        "training_data_0": "https://the-eye.eu/public/AI/training_data/code_clippy_data/code_clippy_dedup_data/",
+        "test_data_0": "openai/openai_humaneval",
+        "paper_0": "https://github.com/CodedotAl/gpt-code-clippy"
+    },
+    {
+        "model_name": "GPT‑Neo‑Math‑Small",
+        "paper_0": "https://github.com/saisurbehera/mathProof"
+    },
+    {
+        "model_name": "GPT‑Neo‑CS‑Finetuned"
+    },
+    {
+        "model_name": "GPT‑Neo‑Literature",
+        "training_data_0": "https://www.gutenberg.org/"
+    },
+    {
+         "name": "GPT‑Neo‑History"
+    }
+]

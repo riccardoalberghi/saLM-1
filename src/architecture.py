@@ -1,8 +1,8 @@
 import torch
 import torch.nn as nn
 from typing import List, Dict, Optional
-from model_loader import ModelLoader, ModelInfo
-from models import MODELS
+from src.model_loader import ModelLoader, ModelInfo
+from src.models import MODELS
 
 class ScalarProjectionHead(nn.Module):
     def __init__(

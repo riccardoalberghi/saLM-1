@@ -48,6 +48,9 @@ class BalancedFinetuningDataset(Dataset):
         self.examples: List[Tuple[str, str]] = []
         random.seed(seed)
 
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+
         datasets_list = []
         for repo in repo_names:
             try:
