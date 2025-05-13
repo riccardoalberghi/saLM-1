@@ -134,8 +134,6 @@ def train_epoch(
 
     for batch_idx, batch in enumerate(progress_bar):
         # Move batch to device
-        input_ids = batch["input_ids"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
         target_ids = batch["target_ids"].to(device)
 
         # Retrieve input and target texts directly from the batch
@@ -223,8 +221,6 @@ def evaluate(
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Evaluating"):
             # Move batch to device
-            input_ids = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
             target_ids = batch["target_ids"].to(device)
             
             # Retrieve input and target texts directly from the batch
