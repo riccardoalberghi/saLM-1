@@ -113,6 +113,7 @@ class BalancedFinetuningDataset(Dataset):
             "attention_mask": input_encoding["attention_mask"].squeeze(),
             "target_ids": target_encoding["input_ids"].squeeze(),
             "input_text": input_text,
+            "target_text": target_text,
         }
 
 def train_epoch(
@@ -137,11 +138,16 @@ def train_epoch(
         attention_mask = batch["attention_mask"].to(device)
         target_ids = batch["target_ids"].to(device)
 
-        # Retrieve input texts directly from the batch
+        # Retrieve input and target texts directly from the batch
         input_texts = batch["input_text"]
+        target_texts = batch["target_text"]
 
-        # Forward pass through the model
-        outputs = model(input_texts)
+        # Build teacher-forcing inputs by concatenating input and target texts
+        tokenizer = model.tokenizers[model.model_ids[0]]
+        combined_texts = [inp + tokenizer.eos_token + tgt for inp, tgt in zip(input_texts, target_texts)]
+
+        # Forward pass through the model with teacher forcing
+        outputs = model(combined_texts)
 
         # Get token logits and model probabilities
         token_logits = outputs["token_logits"]
@@ -153,7 +159,19 @@ def train_epoch(
         model_probs = model.get_model_probs(all_raw_scores)
 
         # Calculate token probabilities
-        token_probs = model.get_token_probs(token_logits)
+        token_probs_full = model.get_token_probs(token_logits)
+
+        # ---------------------------
+        # Align predictions with targets (teacher forcing)
+        # ---------------------------
+        seq_len_target = target_ids.size(1)
+
+        # Keep only the last target_len positions
+        model_probs = model_probs[:, -seq_len_target:, :]
+        token_probs = {
+            mid: probs[:, -seq_len_target:, :]
+            for mid, probs in token_probs_full.items()
+        }
 
         # Calculate loss
         loss = weighted_token_cross_entropy(
@@ -209,11 +227,16 @@ def evaluate(
             attention_mask = batch["attention_mask"].to(device)
             target_ids = batch["target_ids"].to(device)
             
-            # Retrieve input texts directly from the batch
+            # Retrieve input and target texts directly from the batch
             input_texts = batch["input_text"]
+            target_texts = batch["target_text"]
+            
+            # Build teacher-forcing inputs
+            tokenizer = model.tokenizers[model.model_ids[0]]
+            combined_texts = [inp + tokenizer.eos_token + tgt for inp, tgt in zip(input_texts, target_texts)]
             
             # Forward pass
-            outputs = model(input_texts)
+            outputs = model(combined_texts)
             
             # Get token logits and model probabilities
             token_logits = outputs["token_logits"]
@@ -224,7 +247,15 @@ def evaluate(
             model_probs = model.get_model_probs(all_raw_scores)
             
             # Calculate token probabilities
-            token_probs = model.get_token_probs(token_logits)
+            token_probs_full = model.get_token_probs(token_logits)
+            
+            # Align predictions with targets (teacher forcing)
+            seq_len_target = target_ids.size(1)
+            model_probs = model_probs[:, -seq_len_target:, :]
+            token_probs = {
+                mid: probs[:, -seq_len_target:, :]
+                for mid, probs in token_probs_full.items()
+            }
             
             # Calculate loss
             loss = weighted_token_cross_entropy(
