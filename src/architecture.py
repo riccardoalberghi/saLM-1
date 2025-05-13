@@ -16,17 +16,17 @@ class ScalarProjectionHead(nn.Module):
         intermediate_dim = hidden_dim // 2
         
         self.non_linear_projection = nn.Sequential(
-            # nn.Linear(input_dim, hidden_dim),
-            # nn.BatchNorm1d(hidden_dim),
-            # nn.ReLU(),
-            # nn.Dropout(dropout),
+            nn.Linear(input_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
             
-            # nn.Linear(hidden_dim, intermediate_dim),
-            # nn.BatchNorm1d(intermediate_dim),
-            # nn.ReLU(),
-            # nn.Dropout(dropout),
+            nn.Linear(hidden_dim, intermediate_dim),
+            nn.BatchNorm1d(intermediate_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
             
-            nn.Linear(input_dim, 1)  
+            nn.Linear(intermediate_dim, 1)  
         )
     
     def forward(self, hidden_state: torch.Tensor) -> torch.Tensor:

@@ -1,7 +1,7 @@
 myvenv/
 results/
 *.sh
-requirements.txt
 *.pyc
 __pycache__/
 wandb/
+/model_outputs/

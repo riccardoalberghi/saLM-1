@@ -1,0 +1,9 @@
+torch
+transformers
+datasets
+evaluate
+tqdm
+numpy
+fsspec
+huggingface-hub
+wandb
