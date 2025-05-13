@@ -164,10 +164,15 @@ def train_epoch(
         # ---------------------------
         seq_len_target = target_ids.size(1)
 
-        # Keep only the last target_len positions
-        model_probs = model_probs[:, -seq_len_target:, :]
+        # Select predictions that correspond to each target token.
+        # For an autoregressive LM, the logits at position *i* predict token *i+1*.
+        # Because we appended the full target sequence to the input, the first
+        # prediction for the target sequence is located at the EOS position that
+        # precedes the first target token and the final logits position predicts
+        # the token after the last target token (which we discard).
+        model_probs = model_probs[:, -(seq_len_target + 1):-1, :]
         token_probs = {
-            mid: probs[:, -seq_len_target:, :]
+            mid: probs[:, -(seq_len_target + 1):-1, :]
             for mid, probs in token_probs_full.items()
         }
 
@@ -247,9 +252,10 @@ def evaluate(
             
             # Align predictions with targets (teacher forcing)
             seq_len_target = target_ids.size(1)
-            model_probs = model_probs[:, -seq_len_target:, :]
+            # Align predictions with targets as in training (see explanation above)
+            model_probs = model_probs[:, -(seq_len_target + 1):-1, :]
             token_probs = {
-                mid: probs[:, -seq_len_target:, :]
+                mid: probs[:, -(seq_len_target + 1):-1, :]
                 for mid, probs in token_probs_full.items()
             }
             
