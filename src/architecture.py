@@ -16,17 +16,17 @@ class ScalarProjectionHead(nn.Module):
         intermediate_dim = hidden_dim // 2
         
         self.non_linear_projection = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
+            # nn.Linear(input_dim, hidden_dim),
+            # nn.BatchNorm1d(hidden_dim),
+            # nn.ReLU(),
+            # nn.Dropout(dropout),
             
-            nn.Linear(hidden_dim, intermediate_dim),
-            nn.BatchNorm1d(intermediate_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
+            # nn.Linear(hidden_dim, intermediate_dim),
+            # nn.BatchNorm1d(intermediate_dim),
+            # nn.ReLU(),
+            # nn.Dropout(dropout),
             
-            nn.Linear(intermediate_dim, 1)  
+            nn.Linear(input_dim, 1)  
         )
     
     def forward(self, hidden_state: torch.Tensor) -> torch.Tensor:
@@ -92,57 +92,77 @@ class MultiModelWithScalarHeads(nn.Module):
     def forward(self, input_texts: List[str]) -> Dict[str, torch.Tensor]:
         """
         Process input texts through all models and their projection heads.
-        
+
         Args:
             input_texts: Input texts to process as a batch
-            
+
         Returns:
             Dictionary containing hidden states, raw scores, and model IDs
         """
         if not isinstance(input_texts, list):
             input_texts = [input_texts]
-        
-        hidden_states = {}
-        raw_model_scores = {}
-        token_logits = {}
-        
+
+        hidden_states      = {}
+        raw_model_scores   = {}
+        token_logits       = {}
+        seq_lens_per_model = {}
+
+        # -------------------------------------------------
+        # 1. Run every base model and collect its scores
+        # -------------------------------------------------
         for model_id, model in self.base_models.items():
             tokenizer = self.tokenizers[model_id]
-            
-            # Tokenize input
-            inputs = tokenizer(input_texts, padding=True, return_tensors="pt").to(model.device)
-            
-            # Get model outputs
+
+            # Tokenise
+            inputs = tokenizer(input_texts,
+                            padding=True,
+                            return_tensors="pt").to(model.device)
+
+            # Freeze base model parameters
             with torch.no_grad():
                 outputs = model(**inputs, output_hidden_states=True)
-                
-                # Get token logits for future use in training
-                logits = outputs.logits
-                token_logits[model_id] = logits
-                
-                # Get all token representations from the last layer
-                last_hidden_state = outputs.hidden_states[-1].to(self.device)
 
-                # Process each token position
-                batch_size, seq_len, _ = last_hidden_state.shape
-                position_scores = torch.zeros(batch_size, seq_len, device=self.device)
-                
-                for pos in range(seq_len):
-                    # Get representation for this position
-                    token_representation = last_hidden_state[:, pos, :]
-                    
-                    # Apply projection head
-                    position_scores[:, pos] = self.projection_heads[model_id](token_representation).squeeze(-1)
-                
-                # Store token-level scores
-                raw_model_scores[model_id] = position_scores
-        
-        # Stack all raw scores into a single tensor [batch_size, seq_len, num_models]
+            # Save logits (detached)
+            token_logits[model_id] = outputs.logits.detach()
+
+            # Last‑layer hidden states: [B, L, H]
+            last_hidden_state = outputs.hidden_states[-1].to(self.device).detach()
+
+            batch_size, seq_len, _ = last_hidden_state.shape
+            seq_lens_per_model[model_id] = seq_len            # keep track
+
+            # Compute projection‑head scores
+            position_scores = torch.zeros(batch_size, seq_len, device=self.device)
+
+            for pos in range(seq_len):
+                token_representation = last_hidden_state[:, pos, :]
+                position_scores[:, pos] = (
+                    self.projection_heads[model_id](token_representation)
+                    .squeeze(-1)
+                )
+
+            raw_model_scores[model_id] = position_scores     # [B, L]
+
+        # -------------------------------------------------
+        # 2. Right‑pad each tensor with zeros to the max length
+        # -------------------------------------------------
+        max_seq_len = max(seq_lens_per_model.values())
+
+        for model_id, scores in raw_model_scores.items():
+            pad_len = max_seq_len - scores.size(1)
+            if pad_len > 0:
+                # pad on the right (dim=1) with zeros
+                raw_model_scores[model_id] = torch.nn.functional.pad(
+                    scores, (0, pad_len), value=0.0
+                )
+
+        # -------------------------------------------------
+        # 3. Stack into shape [B, max_seq_len, num_models]
+        # -------------------------------------------------
         all_raw_model_scores = torch.stack(
-            [raw_model_scores[model_id] for model_id in self.model_ids], 
+            [raw_model_scores[model_id] for model_id in self.model_ids],
             dim=-1
         )
-                
         
         # Return results
         return {
@@ -230,5 +250,3 @@ class MultiModelWithScalarHeads(nn.Module):
             self.model_loader.unload_all_models()
         except:
             pass
-
-

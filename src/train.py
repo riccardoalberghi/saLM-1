@@ -11,11 +11,12 @@ import os
 import random
 import numpy as np
 from datasets import load_dataset
+import wandb
 
-from src.architecture import MultiModelWithScalarHeads
-from src.loss_functions import weighted_token_cross_entropy
-from src.model_loader import ModelLoader, ModelInfo
-from src.models import MODELS
+from architecture import MultiModelWithScalarHeads
+from loss_functions import weighted_token_cross_entropy
+from model_loader import ModelLoader, ModelInfo
+from models import MODELS
 
 # Setup logging
 logging.basicConfig(
@@ -111,6 +112,7 @@ class BalancedFinetuningDataset(Dataset):
             "input_ids": input_encoding["input_ids"].squeeze(),
             "attention_mask": input_encoding["attention_mask"].squeeze(),
             "target_ids": target_encoding["input_ids"].squeeze(),
+            "input_text": input_text,
         }
 
 def train_epoch(
@@ -120,39 +122,39 @@ def train_epoch(
     scheduler: Optional[torch.optim.lr_scheduler.LambdaLR],
     device: str,
     entropy_weight: float = 0.1,
-    pad_token_id: int = 0
-) -> float:
+    pad_token_id: int = 0,
+    global_step: int = 0,
+    log_every_n_steps: int = 10
+) -> int:
     model.train()
     total_loss = 0.0
-    
+
     progress_bar = tqdm(dataloader, desc="Training")
-    
-    for batch in progress_bar:
+
+    for batch_idx, batch in enumerate(progress_bar):
         # Move batch to device
         input_ids = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
         target_ids = batch["target_ids"].to(device)
-        
-        # Construct input texts from input_ids
-        # Note: This is a simplified approach. In real implementation, you might need to decode the input_ids first
-        # or design your dataset class to provide the texts directly
-        batch_size = input_ids.shape[0]
-        input_texts = ["placeholder"] * batch_size
-        
+
+        # Retrieve input texts directly from the batch
+        input_texts = batch["input_text"]
+
         # Forward pass through the model
         outputs = model(input_texts)
-        
+
         # Get token logits and model probabilities
         token_logits = outputs["token_logits"]
         all_raw_scores = outputs["all_raw_scores"]
+        raw_scores = outputs["raw_scores"]
         model_ids = outputs["model_ids"]
-        
+
         # Calculate model probabilities
         model_probs = model.get_model_probs(all_raw_scores)
-        
+
         # Calculate token probabilities
         token_probs = model.get_token_probs(token_logits)
-        
+
         # Calculate loss
         loss = weighted_token_cross_entropy(
             token_probs_dict=token_probs,
@@ -162,20 +164,33 @@ def train_epoch(
             entropy_weight=entropy_weight,
             pad_token_id=pad_token_id
         )
-        
+
         # Backward pass
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
-        
+
         if scheduler is not None:
             scheduler.step()
-        
+
         # Update progress
         total_loss += loss.item()
         progress_bar.set_postfix({"loss": loss.item()})
-    
-    return total_loss / len(dataloader)
+
+        # wandb logging every n steps
+        global_step += 1
+        if global_step % log_every_n_steps == 0:
+            # Prepare logging dictionary
+            log_dict = {
+                "train/loss": loss.item(),
+                "train/global_step": global_step
+            }
+            # Log mean projection head outputs for each model
+            for model_id, scores in raw_scores.items():
+                log_dict[f"train/projection_mean/{model_id}"] = scores.mean().item()
+            wandb.log(log_dict, step=global_step)
+
+    return global_step
 
 def evaluate(
     model: MultiModelWithScalarHeads,
@@ -194,9 +209,8 @@ def evaluate(
             attention_mask = batch["attention_mask"].to(device)
             target_ids = batch["target_ids"].to(device)
             
-            # Similar to training, construct input_texts 
-            batch_size = input_ids.shape[0]
-            input_texts = ["placeholder"] * batch_size
+            # Retrieve input texts directly from the batch
+            input_texts = batch["input_text"]
             
             # Forward pass
             outputs = model(input_texts)
@@ -282,6 +296,9 @@ def main():
     
     args = parser.parse_args()
     
+    # Initialize wandb
+    wandb.init(project="multimodel-finetuning", config=vars(args))
+    
     # Set random seed
     set_seed(args.seed)
     
@@ -362,19 +379,24 @@ def main():
     logger.info("Starting training")
     best_val_loss = float('inf')
     
+    global_step = 0
+    log_every_n_steps = 10  # You can make this an argparse argument if desired
+
     for epoch in range(args.num_epochs):
         logger.info(f"Epoch {epoch + 1}/{args.num_epochs}")
-        
-        # Train for one epoch
-        train_loss = train_epoch(
+
+        # Train for one epoch, logging every few steps
+        global_step = train_epoch(
             model=model,
             dataloader=train_dataloader,
             optimizer=optimizer,
             scheduler=scheduler,
             device=device,
-            entropy_weight=args.entropy_weight
+            entropy_weight=args.entropy_weight,
+            global_step=global_step,
+            log_every_n_steps=log_every_n_steps
         )
-        
+
         # Evaluate
         val_loss = evaluate(
             model=model,
@@ -382,9 +404,16 @@ def main():
             device=device,
             entropy_weight=args.entropy_weight
         )
-        
-        logger.info(f"Epoch {epoch + 1}: Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
-        
+
+        logger.info(f"Epoch {epoch + 1}: Val Loss: {val_loss:.4f}")
+
+        # Log validation loss and best validation loss to wandb
+        wandb.log({
+            "epoch": epoch + 1,
+            "val/loss": val_loss,
+            "val/best_loss": best_val_loss if val_loss >= best_val_loss else val_loss
+        }, step=global_step)
+
         # Save checkpoint
         save_checkpoint(
             model=model,
@@ -394,24 +423,25 @@ def main():
             loss=val_loss,
             output_dir=args.output_dir
         )
-        
+
         # Save best model (only projection heads)
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            
+
             # Extract projection heads state dict
             projection_heads_state = {}
             model_state_dict = model.state_dict()
-            
+
             for key in model_state_dict:
                 # Only save parameters for the projection heads
                 if 'projection_heads' in key:
                     projection_heads_state[key] = model_state_dict[key]
-                    
+
             torch.save(projection_heads_state, os.path.join(args.output_dir, "best_model_heads.pt"))
             logger.info(f"Saved new best model heads with validation loss: {val_loss:.4f}")
-    
+
     logger.info("Training completed!")
+    wandb.finish()
 
 if __name__ == "__main__":
     main()

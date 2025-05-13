@@ -32,13 +32,25 @@ def weighted_token_cross_entropy(
     batch_size, seq_len, num_models = model_probs.shape
     vocab_size = next(iter(token_probs_dict.values())).size(-1)
     
-    # Assert consistent sequence lengths
-    assert target_tokens.size(1) >= seq_len, "target_tokens sequence length too short"
-    for model_id in model_ids:
-        assert token_probs_dict[model_id].size(1) >= seq_len, f"token_probs for {model_id} sequence length too short"
+    # ------------------------------------------------------------------
+    # Align sequence lengths across all inputs by using the minimum length
+    # available. This avoids assertion errors when some tensors are shorter
+    # than others (e.g., target sequence shorter than model_probs length).
+    # ------------------------------------------------------------------
+    effective_seq_len = min(
+        seq_len,
+        target_tokens.size(1),
+        *[token_probs_dict[model_id].size(1) for model_id in model_ids]
+    )
     
-    # Use only the required sequence length from target
-    target_tokens = target_tokens[:, :seq_len]
+    # Trim tensors to the effective sequence length
+    model_probs = model_probs[:, :effective_seq_len]
+    target_tokens = target_tokens[:, :effective_seq_len]
+    for model_id in model_ids:
+        token_probs_dict[model_id] = token_probs_dict[model_id][:, :effective_seq_len]
+    
+    # Update seq_len to reflect the aligned length
+    seq_len = effective_seq_len
     
     # Initialize tensor for combined probabilities
     combined_probs = torch.zeros(batch_size, seq_len, vocab_size, device=target_tokens.device, requires_grad=True)
@@ -76,12 +88,12 @@ def weighted_token_cross_entropy(
         max_index = vocab_size - 1
         target_non_pad = torch.clamp(target_non_pad, 0, max_index)
         
-        # Calculate cross entropy loss
-        token_loss = F.cross_entropy(
-            combined_probs_non_pad,
-            target_non_pad,
-            reduction='mean'
-        )
+        # Calculate negative log-likelihood loss directly from predicted probabilities
+        # Gather the probability assigned to the correct target token at each position
+        selected_probs = combined_probs_non_pad.gather(1, target_non_pad.unsqueeze(1)).squeeze(1)
+        
+        # Use ‑log(p) as the loss (add small epsilon for numerical stability)
+        token_loss = -torch.log(selected_probs + 1e-10).mean()
     else:
         # If all tokens are padding, return zero loss
         # Use a tensor connected to the graph

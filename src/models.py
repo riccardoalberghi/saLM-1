@@ -1,4 +1,4 @@
-from src.model_loader import ModelInfo
+from model_loader import ModelInfo
 
 MODELS = [
     ModelInfo(
@@ -15,13 +15,13 @@ MODELS = [
         parameters=125_000_000,
         task="Code completion"
     ),
-    ModelInfo(
-        id="gpt-neo-apps",
-        name="GPT‑Neo‑125M‑APPS",
-        path="flax-community/gpt-neo-125M-apps",
-        parameters=125_000_000,
-        task="Programming problem solving"
-    ),
+    # ModelInfo(
+    #     id="gpt-neo-apps",
+    #     name="GPT‑Neo‑125M‑APPS",
+    #     path="flax-community/gpt-neo-125M-apps",
+    #     parameters=125_000_000,
+    #     task="Programming problem solving"
+    # ),
     ModelInfo(
         id="gpt-neo-math",
         name="GPT‑Neo‑Math‑Small",
@@ -29,25 +29,25 @@ MODELS = [
         parameters=125_000_000,
         task="Proof‑step generation (Lean tactics)"
     ),
-    ModelInfo(
-        id="gpt-neo-cs",
-        name="GPT‑Neo‑CS‑Finetuned",
-        path="KimByeongSu/gpt-neo-125m-cs-finetuning-20000",
-        parameters=125_000_000,
-        task="Computer science (code & tutorials)"
-    ),
-    ModelInfo(
-        id="gpt-neo-literature",
-        name="GPT‑Neo‑Literature",
-        path="hakurei/lit-125M",
-        parameters=125_000_000,
-        task="Fictional storytelling"
-    ),
-    ModelInfo(
-        id="gpt-neo-history",
-        name="GPT‑Neo‑History",
-        path="shubhamgantayat/EleutherAI-gpt-neo-125m-brief-history-of-time-model",
-        parameters=125_000_000,
-        task="Historical analysis"
-    )
+    # ModelInfo(
+    #     id="gpt-neo-cs",
+    #     name="GPT‑Neo‑CS‑Finetuned",
+    #     path="KimByeongSu/gpt-neo-125m-cs-finetuning-20000",
+    #     parameters=125_000_000,
+    #     task="Computer science (code & tutorials)"
+    # ),
+    # ModelInfo(
+    #     id="gpt-neo-literature",
+    #    name="GPT‑Neo‑Literature",
+    #     path="hakurei/lit-125M",
+    #     parameters=125_000_000,
+    #     task="Fictional storytelling"
+    # ),
+    # ModelInfo(
+    #     id="gpt-neo-history",
+    #     name="GPT‑Neo‑History",
+    #     path="shubhamgantayat/EleutherAI-gpt-neo-125m-brief-history-of-time-model",
+    #     parameters=125_000_000,
+    #     task="Historical analysis"
+    # )
 ]
