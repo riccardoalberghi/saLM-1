@@ -37,20 +37,20 @@ def weighted_token_cross_entropy(
     # available. This avoids assertion errors when some tensors are shorter
     # than others (e.g., target sequence shorter than model_probs length).
     # ------------------------------------------------------------------
-    effective_seq_len = min(
-        seq_len,
-        target_tokens.size(1),
-        *[token_probs_dict[model_id].size(1) for model_id in model_ids]
-    )
+    # effective_seq_len = min(
+    #     seq_len,
+    #     target_tokens.size(1),
+    #     *[token_probs_dict[model_id].size(1) for model_id in model_ids]
+    # )
     
     # Trim tensors to the effective sequence length
-    model_probs = model_probs[:, :effective_seq_len]
-    target_tokens = target_tokens[:, :effective_seq_len]
-    for model_id in model_ids:
-        token_probs_dict[model_id] = token_probs_dict[model_id][:, :effective_seq_len]
+    # model_probs = model_probs[:, :effective_seq_len]
+    # target_tokens = target_tokens[:, :effective_seq_len]
+    # for model_id in model_ids:
+    #     token_probs_dict[model_id] = token_probs_dict[model_id][:, :effective_seq_len]
     
     # Update seq_len to reflect the aligned length
-    seq_len = effective_seq_len
+    # seq_len = effective_seq_len
     
     # Initialize tensor for combined probabilities
     combined_probs = torch.zeros(batch_size, seq_len, vocab_size, device=target_tokens.device, requires_grad=True)
