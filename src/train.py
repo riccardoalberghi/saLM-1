@@ -17,6 +17,7 @@ from architecture import MultiModelWithScalarHeads
 from loss_functions import weighted_token_cross_entropy
 from model_loader import ModelLoader, ModelInfo
 from models import MODELS
+from globals import *
 
 # Setup logging
 logging.basicConfig(
@@ -40,7 +41,7 @@ class BalancedFinetuningDataset(Dataset):
         repo_names: List[str],
         tokenizer,
         split: str = "train",
-        max_length: int = 128,
+        max_length: int = MAX_LENGTH,
         shuffle: bool = True,
         seed: int = 42,
     ):
@@ -129,6 +130,7 @@ def train_epoch(
 ) -> int:
     model.train()
     total_loss = 0.0
+    truncation_count = 0
 
     progress_bar = tqdm(dataloader, desc="Training")
 
@@ -140,9 +142,29 @@ def train_epoch(
         input_texts = batch["input_text"]
         target_texts = batch["target_text"]
 
-        # Build teacher-forcing inputs by concatenating input and target texts
+        # Get the tokenizer
         tokenizer = model.tokenizers[model.model_ids[0]]
-        combined_texts = [inp + tokenizer.eos_token + tgt for inp, tgt in zip(input_texts, target_texts)]
+        
+        # Build teacher-forcing inputs by concatenating input and target texts
+        # Handle max sequence length gracefully
+        combined_texts = []
+        for inp, tgt in zip(input_texts, target_texts):
+            # Combine input and target with EOS token
+            combined = inp + tokenizer.eos_token + tgt
+            
+            # Tokenize to check length
+            tokens = tokenizer.encode(combined, add_special_tokens=False)
+            
+            # If combined text is too long, truncate from the beginning
+            # This keeps the most recent part of the input and all of the target
+            if len(tokens) > MAX_LENGTH:
+                truncation_count += 1
+                # Take the last MAX_LENGTH tokens
+                tokens = tokens[-MAX_LENGTH:]
+                # Convert back to text
+                combined = tokenizer.decode(tokens)
+            
+            combined_texts.append(combined)
 
         # Forward pass through the model with teacher forcing
         outputs = model(combined_texts)
@@ -150,7 +172,6 @@ def train_epoch(
         # Get token logits and model probabilities
         token_logits = outputs["token_logits"]
         all_raw_scores = outputs["all_raw_scores"]
-        raw_scores = outputs["raw_scores"]
         model_ids = outputs["model_ids"]
 
         # Calculate model probabilities
@@ -170,7 +191,7 @@ def train_epoch(
         # prediction for the target sequence is located at the EOS position that
         # precedes the first target token and the final logits position predicts
         # the token after the last target token (which we discard).
-        model_probs = model_probs[:, -(seq_len_target + 1):-1, :]
+        model_probs_aligned = model_probs[:, -(seq_len_target + 1):-1, :]
         token_probs = {
             mid: probs[:, -(seq_len_target + 1):-1, :]
             for mid, probs in token_probs_full.items()
@@ -179,7 +200,7 @@ def train_epoch(
         # Calculate loss
         loss = weighted_token_cross_entropy(
             token_probs_dict=token_probs,
-            model_probs=model_probs,
+            model_probs=model_probs_aligned,
             target_tokens=target_ids,
             model_ids=model_ids,
             entropy_weight=entropy_weight,
@@ -204,12 +225,56 @@ def train_epoch(
             # Prepare logging dictionary
             log_dict = {
                 "train/loss": loss.item(),
-                "train/global_step": global_step
+                "train/global_step": global_step,
+                "train/truncated_sequences": truncation_count
             }
-            # Log mean projection head outputs for each model
-            for model_id, scores in raw_scores.items():
-                log_dict[f"train/projection_mean/{model_id}"] = scores.mean().item()
+            
+            # Get the mask for non-padding tokens (to ignore padding in activation counts)
+            non_padding_mask = (target_ids != pad_token_id).float()
+            
+            # Track model activations (which model has highest probability at each position)
+            # Get model with highest probability at each position [batch_size, seq_len]
+            _, max_model_indices = model_probs_aligned.max(dim=2)
+            
+            # Initialize counter for model activations
+            activations_count = {model_id: 0 for model_id in model_ids}
+            total_valid_positions = non_padding_mask.sum().item()
+            
+            # Count activations across the batch for each model
+            for i, model_id in enumerate(model_ids):
+                # Count positions where this model has highest probability (excluding padding)
+                model_activated = (max_model_indices == i).float() * non_padding_mask
+                activations = model_activated.sum().item()
+                activations_count[model_id] = int(activations)
+            
+            # Log mean model probabilities and activation metrics for each model
+            for i, model_id in enumerate(model_ids):
+                # Extract the probability for this model at each position [batch_size, seq_len]
+                model_prob = model_probs_aligned[:, :, i]
+                
+                # Calculate mean across batch and sequence dimensions (for non-padding tokens)
+                valid_probs = model_prob * non_padding_mask
+                sum_probs = valid_probs.sum().item()
+                mean_prob = sum_probs / (total_valid_positions + 1e-10)  # Avoid division by zero
+                
+                # Log the mean probability
+                log_dict[f"train/model_prob_mean/{model_id}"] = mean_prob
+                
+                # Log the activation percentage (how often this model is chosen)
+                activation_percentage = activations_count[model_id] / (total_valid_positions + 1e-10) * 100
+                log_dict[f"train/model_activation_percent/{model_id}"] = activation_percentage
+                
+                # Log the raw activation count
+                log_dict[f"train/model_activation_count/{model_id}"] = activations_count[model_id]
+            
+            # Log total number of valid (non-padding) positions
+            log_dict["train/total_valid_positions"] = total_valid_positions
+            
             wandb.log(log_dict, step=global_step)
+    
+    # Log final truncation count
+    if truncation_count > 0:
+        logger.info(f"Truncated {truncation_count} sequences during training due to exceeding max length of {MAX_LENGTH}")
 
     return global_step
 
@@ -222,6 +287,12 @@ def evaluate(
 ) -> float:
     model.eval()
     total_loss = 0.0
+    truncation_count = 0
+    
+    # Counters for validation statistics
+    model_prob_sums = {model_id: 0.0 for model_id in model.model_ids}
+    model_activations = {model_id: 0 for model_id in model.model_ids}
+    total_valid_positions = 0
     
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Evaluating"):
@@ -232,9 +303,27 @@ def evaluate(
             input_texts = batch["input_text"]
             target_texts = batch["target_text"]
             
-            # Build teacher-forcing inputs
+            # Get the tokenizer
             tokenizer = model.tokenizers[model.model_ids[0]]
-            combined_texts = [inp + tokenizer.eos_token + tgt for inp, tgt in zip(input_texts, target_texts)]
+            
+            # Build teacher-forcing inputs with length handling
+            combined_texts = []
+            for inp, tgt in zip(input_texts, target_texts):
+                # Combine input and target with EOS token
+                combined = inp + tokenizer.eos_token + tgt
+                
+                # Tokenize to check length
+                tokens = tokenizer.encode(combined, add_special_tokens=False)
+                
+                # If combined text is too long, truncate from the beginning
+                if len(tokens) > MAX_LENGTH:
+                    truncation_count += 1
+                    # Take the last MAX_LENGTH tokens
+                    tokens = tokens[-MAX_LENGTH:]
+                    # Convert back to text
+                    combined = tokenizer.decode(tokens)
+                
+                combined_texts.append(combined)
             
             # Forward pass
             outputs = model(combined_texts)
@@ -252,8 +341,8 @@ def evaluate(
             
             # Align predictions with targets (teacher forcing)
             seq_len_target = target_ids.size(1)
-            # Align predictions with targets as in training (see explanation above)
-            model_probs = model_probs[:, -(seq_len_target + 1):-1, :]
+            # Align predictions with targets as in training
+            model_probs_aligned = model_probs[:, -(seq_len_target + 1):-1, :]
             token_probs = {
                 mid: probs[:, -(seq_len_target + 1):-1, :]
                 for mid, probs in token_probs_full.items()
@@ -262,7 +351,7 @@ def evaluate(
             # Calculate loss
             loss = weighted_token_cross_entropy(
                 token_probs_dict=token_probs,
-                model_probs=model_probs,
+                model_probs=model_probs_aligned,
                 target_tokens=target_ids,
                 model_ids=model_ids,
                 entropy_weight=entropy_weight,
@@ -270,9 +359,60 @@ def evaluate(
             )
             
             total_loss += loss.item()
+            
+            # Get the mask for non-padding tokens
+            non_padding_mask = (target_ids != pad_token_id).float()
+            
+            # Get model with highest probability at each position
+            _, max_model_indices = model_probs_aligned.max(dim=2)
+            
+            # Calculate batch statistics
+            batch_valid_positions = non_padding_mask.sum().item()
+            
+            # Gather statistics
+            for i, model_id in enumerate(model_ids):
+                # Aggregate probabilities for this model (excluding padding)
+                model_prob = model_probs_aligned[:, :, i]
+                valid_probs = model_prob * non_padding_mask
+                model_prob_sums[model_id] += valid_probs.sum().item()
+                
+                # Count positions where this model has highest probability
+                model_activated = (max_model_indices == i).float() * non_padding_mask
+                model_activations[model_id] += model_activated.sum().item()
+            
+            # Accumulate total non-padding positions
+            total_valid_positions += batch_valid_positions
+    
+    # Log validation statistics to wandb
+    val_log_dict = {
+        "val/loss": total_loss / len(dataloader),
+        "val/truncated_sequences": truncation_count
+    }
+    
+    # Log mean probabilities and activation percentages
+    for model_id in model.model_ids:
+        # Calculate mean probability
+        mean_prob = model_prob_sums[model_id] / (total_valid_positions + 1e-10)
+        val_log_dict[f"val/model_prob_mean/{model_id}"] = mean_prob
+        
+        # Calculate activation percentage
+        activation_percentage = (model_activations[model_id] / (total_valid_positions + 1e-10)) * 100
+        val_log_dict[f"val/model_activation_percent/{model_id}"] = activation_percentage
+        val_log_dict[f"val/model_activation_count/{model_id}"] = model_activations[model_id]
+    
+    # Log total valid positions
+    val_log_dict["val/total_valid_positions"] = total_valid_positions
+    
+    # Log to wandb
+    wandb.log(val_log_dict)
+    
+    # Log truncation count
+    if truncation_count > 0:
+        logger.info(f"Truncated {truncation_count} sequences during evaluation due to exceeding max length of {MAX_LENGTH}")
     
     return total_loss / len(dataloader)
 
+# Save the model checkpoint
 def save_checkpoint(
     model: MultiModelWithScalarHeads,
     optimizer: torch.optim.Optimizer,
@@ -326,6 +466,7 @@ def main():
         required=True,
         help="List of HuggingFace dataset repository names for finetuning."
     )
+    parser.add_argument("--log_every_n_steps", type=int, default=10, help="Log metrics every N steps")
     
     args = parser.parse_args()
     
@@ -363,7 +504,6 @@ def main():
     logger.info(f"Number of trainable parameters: {trainable_params}")
     
     # Get a tokenizer from the first model to use for the dataset
-    # In practice, you might want to handle different tokenizers for different models more carefully
     first_model_id = MODELS[0].id
     tokenizer = model.tokenizers[first_model_id]
     
@@ -413,7 +553,6 @@ def main():
     best_val_loss = float('inf')
     
     global_step = 0
-    log_every_n_steps = 10  # You can make this an argparse argument if desired
 
     for epoch in range(args.num_epochs):
         logger.info(f"Epoch {epoch + 1}/{args.num_epochs}")
@@ -427,7 +566,7 @@ def main():
             device=device,
             entropy_weight=args.entropy_weight,
             global_step=global_step,
-            log_every_n_steps=log_every_n_steps
+            log_every_n_steps=args.log_every_n_steps
         )
 
         # Evaluate

@@ -74,6 +74,8 @@ class MultiModelWithScalarHeads(nn.Module):
         assert all(size == hidden_sizes[0] for size in hidden_sizes), \
             f"All models must have the same hidden size. Found sizes: {hidden_sizes}"
         
+        self.common_tokenizer = self.tokenizers[self.model_ids[0]]
+
         self.hidden_size = hidden_sizes[0]
         
         # Create a projection head for each model
@@ -107,16 +109,14 @@ class MultiModelWithScalarHeads(nn.Module):
         token_logits       = {}
         seq_lens_per_model = {}
 
+        #tokenize with the common tokenizer
+        inputs = self.common_tokenizer(input_texts,
+                    padding=True,
+                    return_tensors="pt").to(self.device)
         # -------------------------------------------------
         # 1. Run every base model and collect its scores
         # -------------------------------------------------
         for model_id, model in self.base_models.items():
-            tokenizer = self.tokenizers[model_id]
-
-            # Tokenise
-            inputs = tokenizer(input_texts,
-                            padding=True,
-                            return_tensors="pt").to(model.device)
 
             # Freeze base model parameters
             with torch.no_grad():
