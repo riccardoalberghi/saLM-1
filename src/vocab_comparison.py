@@ -108,7 +108,7 @@ def compare_tokenizer_vocabularies(models):
     # Save vocabulary mismatches to a file
     print("\n===== Generating Vocabulary Mapping =====")
     # Choose the general model as the reference
-    reference_model = "gpt-neo-general"
+    reference_model = f"{MODELS[0].id}"
     reference_vocab = vocabs[reference_model]
     
     # Create mappings between vocabularies

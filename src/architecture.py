@@ -9,7 +9,9 @@ class ScalarProjectionHead(nn.Module):
         self, 
         input_dim: int,
         hidden_dim: int = 256,
-        dropout: float = 0.1
+        dropout: float = 0.1,
+        dtype: torch.dtype = torch.float32  # Added dtype parameter
+
     ):
         super().__init__()
         
@@ -28,8 +30,12 @@ class ScalarProjectionHead(nn.Module):
             
             nn.Linear(intermediate_dim, 1)  
         )
+        self.to(dtype)
     
     def forward(self, hidden_state: torch.Tensor) -> torch.Tensor:
+        # Convert the input tensor to the same dtype as the projection head
+        if hidden_state.dtype != next(self.parameters()).dtype:
+            hidden_state = hidden_state.to(next(self.parameters()).dtype)
         return self.non_linear_projection(hidden_state)
 
 
@@ -41,10 +47,15 @@ class MultiModelWithScalarHeads(nn.Module):
         head_hidden_dim: int = 256,
         head_dropout: float = 0.1,
         model_loader: Optional[ModelLoader] = None,
-        device: str = None
+        device: str = None,
+        dtype: torch.dtype = torch.float32  # Added dtype parameter
+
     ):
         super().__init__()
         
+        self.device = device if device is not None else ('cuda' if torch.cuda.is_available() else 'cpu')
+        self.dtype = dtype
+
         self.model_loader = model_loader if model_loader else ModelLoader(device)
         
         self.base_models = {}
