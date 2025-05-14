@@ -5,3 +5,8 @@ results/
 __pycache__/
 wandb/
 /model_outputs/
+
+docs/
+notes.txt
+
+.DS_Store
