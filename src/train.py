@@ -202,9 +202,9 @@ def train_epoch(
             token_probs_dict=token_probs,
             model_probs=model_probs_aligned,
             target_tokens=target_ids,
+            pad_token_id=pad_token_id,
             model_ids=model_ids,
-            entropy_weight=entropy_weight,
-            pad_token_id=pad_token_id
+            entropy_weight=entropy_weight
         )
 
         # Backward pass
@@ -353,9 +353,9 @@ def evaluate(
                 token_probs_dict=token_probs,
                 model_probs=model_probs_aligned,
                 target_tokens=target_ids,
+                pad_token_id=pad_token_id,
                 model_ids=model_ids,
-                entropy_weight=entropy_weight,
-                pad_token_id=pad_token_id
+                entropy_weight=entropy_weight
             )
             
             total_loss += loss.item()
@@ -446,6 +446,8 @@ def save_checkpoint(
     logger.info(f"Saved checkpoint for epoch {epoch}")
 
 def main():
+
+    # COLA AZZOPPA I VECCHI
     parser = argparse.ArgumentParser(description="Train MultiModelWithScalarHeads")
     
     parser.add_argument("--output_dir", type=str, default="./model_outputs", help="Directory to save model checkpoints")
@@ -507,6 +509,10 @@ def main():
     first_model_id = MODELS[0].id
     tokenizer = model.tokenizers[first_model_id]
     
+    # Get the correct pad token ID from the tokenizer
+    pad_token_id = tokenizer.pad_token_id
+    logger.info(f"Using pad_token_id = {pad_token_id} from tokenizer")
+    
     # Create dataset and dataloaders
     # Build balanced finetuning dataset
     train_dataset = BalancedFinetuningDataset(
@@ -565,6 +571,7 @@ def main():
             scheduler=scheduler,
             device=device,
             entropy_weight=args.entropy_weight,
+            pad_token_id=pad_token_id,  # Pass correct pad token ID
             global_step=global_step,
             log_every_n_steps=args.log_every_n_steps
         )
@@ -574,7 +581,8 @@ def main():
             model=model,
             dataloader=val_dataloader,
             device=device,
-            entropy_weight=args.entropy_weight
+            entropy_weight=args.entropy_weight,
+            pad_token_id=pad_token_id  # Pass correct pad token ID
         )
 
         logger.info(f"Epoch {epoch + 1}: Val Loss: {val_loss:.4f}")

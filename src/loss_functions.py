@@ -6,9 +6,9 @@ def weighted_token_cross_entropy(
     token_probs_dict: Dict[str, torch.Tensor],
     model_probs: torch.Tensor,  # [batch_size, seq_len, num_models]
     target_tokens: torch.Tensor,
+    pad_token_id: int,
     model_ids: List[str],
-    entropy_weight: float = 0.1,
-    pad_token_id: int = 0
+    entropy_weight: float = 0.1
 ) -> torch.Tensor:
     """
     Calculate weighted token cross-entropy loss with token-level routing.
