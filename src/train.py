@@ -418,7 +418,16 @@ def main():
     
     # Standardize special tokens across all tokenizers
     logger.info("Standardizing special tokens across all tokenizers")
-    standard_model_id = "llama-3_2-1b-gsm8k-full-finetuning"  # Use the second model as standard
+    
+    # Get available model IDs from the model
+    available_model_ids = list(model.tokenizers.keys())
+    if not available_model_ids:
+        raise ValueError("No models loaded. Check your model configuration.")
+    
+    # Use the first model as the standard model
+    standard_model_id = available_model_ids[0]
+    logger.info(f"Using {standard_model_id} as the standard model for tokenization")
+    
     standard_tokenizer = model.tokenizers[standard_model_id]
     
     for model_id, tokenizer in model.tokenizers.items():
@@ -426,7 +435,7 @@ def main():
             # Set special tokens to match standard tokenizer
             tokenizer.pad_token = standard_tokenizer.pad_token
             tokenizer.eos_token = standard_tokenizer.eos_token
-            tokenizer.bos_token = standard_tokenizer.bos_token
+            tokenizer.bos_token = standard_tokenizer.bos_token if hasattr(standard_tokenizer, 'bos_token') else tokenizer.bos_token
             logger.info(f"Standardized special tokens for {model_id}")
     
     # Use the standard tokenizer for dataset
