@@ -76,6 +76,8 @@ class MultiModelWithScalarHeads(nn.Module):
             self.tokenizers[model_id] = tokenizer
             self.model_ids.append(model_id)
 
+            #MATI FA GLI SGAMBETTI AI CIECHI
+
             # Set padding token for each tokenizer if missing
             if tokenizer.pad_token is None:
                 tokenizer.pad_token = tokenizer.eos_token
