@@ -263,3 +263,80 @@ class MultiModelWithScalarHeads(nn.Module):
             self.model_loader.unload_all_models()
         except:
             pass
+        
+    def generate(
+        self,
+        prompt: str,
+        max_new_tokens: int = 50,
+        stop_token: Optional[str] = None,
+        temperature: float = 1.0,
+        return_decisions: bool = True
+    ) -> str | Dict[str, any]:
+        """
+        Generate text from a prompt using model-wise confidence to select next token.
+        Optionally returns model decisions at each step.
+
+        Args:
+            prompt (str): The input prompt/question.
+            max_new_tokens (int): Max number of tokens to generate.
+            stop_token (Optional[str]): Optional string to stop early.
+            temperature (float): Softmax temperature (1.0 = no scaling).
+            return_decisions (bool): Whether to return a log of token + model at each step.
+
+        Returns:
+            Either a generated string or a dict with full trace if return_decisions=True.
+        """
+
+        tokenizer = self.common_tokenizer
+        input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(self.device)
+
+        generation_trace = []
+
+        for _ in range(max_new_tokens):
+            input_text = tokenizer.decode(input_ids[0], skip_special_tokens=False)
+
+            outputs = self([input_text])
+            token_logits = outputs["token_logits"]
+            all_raw_scores = outputs["all_raw_scores"]
+
+            # Get model confidence at last token
+            model_confidence = self.get_model_probs(all_raw_scores)
+            last_pos = model_confidence.shape[1] - 1
+            best_model_idx = torch.argmax(model_confidence[0, last_pos]).item()
+            best_model_id = self.model_ids[best_model_idx]
+
+            # Get logits from the chosen model at last position
+            logits = token_logits[best_model_id][0, -1, :]
+
+            # Temperature scaling
+            if temperature != 1.0:
+                logits = logits / temperature
+
+            probs = torch.softmax(logits, dim=-1)
+            next_token_id = torch.argmax(probs).unsqueeze(0).unsqueeze(0).to(self.device)
+
+            # Append token
+            input_ids = torch.cat([input_ids, next_token_id], dim=1)
+
+            # Decode token and track model
+            decoded_token = tokenizer.decode(next_token_id[0])
+            generation_trace.append({
+                "token": decoded_token,
+                "token_id": next_token_id.item(),
+                "model_id": best_model_id
+            })
+
+            if stop_token and stop_token in decoded_token:
+                break
+            if next_token_id.item() == tokenizer.eos_token_id:
+                break
+
+        full_output = tokenizer.decode(input_ids[0], skip_special_tokens=True)
+
+        if return_decisions:
+            return {
+                "generated_text": full_output,
+                "steps": generation_trace
+            }
+        else:
+            return full_output
