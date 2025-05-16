@@ -16,8 +16,9 @@ def main():
         device=device
     )
 
-    prompt = "What is the cosine of 2π?"
-    result = model.generate(prompt, max_new_tokens=10)
+    prompt = """You will receive a question and you'll have to provide a sensible answer for it, but reason a bit beforehand. All results should be explicit. You prompt should start with "Ok, let's reason about that:
+    Question: A kilogram of pork costs $6 while a kilogram of chicken costs $2 less. How much will a 3-kilogram of chicken and a kilogram of pork cost?"""
+    result = model.generate(prompt, max_new_tokens=100)
 
     print("\n=== Prompt ===")
     print(prompt)

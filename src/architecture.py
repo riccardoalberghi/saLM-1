@@ -38,6 +38,15 @@ class ScalarProjectionHead(nn.Module):
             hidden_state = hidden_state.to(next(self.parameters()).dtype)
         return self.non_linear_projection(hidden_state)
 
+    def train(self, mode:bool = True):
+        super().train(mode)
+
+        self.non_linear_projection.train(mode)
+        return self
+
+    def eval(self, mode:bool = True):
+        return self.train(not mode)
+
 
 class MultiModelWithScalarHeads(nn.Module):
     
@@ -264,11 +273,23 @@ class MultiModelWithScalarHeads(nn.Module):
         except:
             pass
         
+    def train(self, mode:bool = True):
+        super().train(mode)
+
+        for model in self.base_models.values():
+            model.train(mode)
+        for head in self.projection_heads.values():
+            head.train(mode)
+
+        return self
+
+    def eval(self, mode:bool = True):
+        return self.train(not mode)
+
     def generate(
         self,
         prompt: str,
         max_new_tokens: int = 50,
-        stop_token: Optional[str] = None,
         temperature: float = 1.0,
         return_decisions: bool = True
     ) -> str | Dict[str, any]:
@@ -287,8 +308,11 @@ class MultiModelWithScalarHeads(nn.Module):
             Either a generated string or a dict with full trace if return_decisions=True.
         """
 
+        self.eval()
+
         tokenizer = self.common_tokenizer
         input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(self.device)
+        stop_token = tokenizer.eos_token
 
         generation_trace = []
 
