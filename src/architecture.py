@@ -292,19 +292,24 @@ class MultiModelWithScalarHeads(nn.Module):
         max_new_tokens: int = 200,
         temperature: float = 1.0,
         return_decisions: bool = False,
-        return_token_ids: bool = True,  # New parameter to control output format
+        return_token_ids: bool = True,
+        model_selection_strategy: str = "confidence",  # 'confidence' or 'cached'
         **kwargs  # Accept all standard generation parameters
     ):
         """
-        Generate text using model-wise confidence to select next token.
-        Supports both string prompts and tokenized inputs.
-        Optionally returns model decisions at each step and/or raw token IDs.
+        Generate text using model-wise confidence to select the next token.
+        Optimized for speed with cached processing and efficient token handling.
 
         Args:
             max_new_tokens (int): Max number of tokens to generate.
-            temperature (float): Softmax temperature (1.0 = no scaling).
+            temperature (float): Controls the randomness of predictions.
+                - If temperature=0: Greedy decoding (always selects most likely token)
+                - If temperature>0: Uses sampling with temperature scaling (higher = more random)
             return_decisions (bool): Whether to return a log of token + model at each step.
             return_token_ids (bool): Whether to return token IDs instead of decoded text.
+            model_selection_strategy (str): Strategy for model selection:
+                - 'confidence': Select model with highest confidence score (default)
+                - 'cached': Use cached model selection for consecutive tokens
             **kwargs: Additional generation parameters including:
                 - input_ids: Pre-tokenized input IDs
                 - attention_mask: Attention mask for the input
@@ -317,7 +322,6 @@ class MultiModelWithScalarHeads(nn.Module):
             - If return_token_ids=False, return_decisions=False: Returns decoded string (only generated text)
             - If return_token_ids=False, return_decisions=True: Returns dict with decoded text and generation steps
         """
-
         self.eval()
         tokenizer = self.common_tokenizer
         
@@ -329,122 +333,150 @@ class MultiModelWithScalarHeads(nn.Module):
         # Handle already tokenized inputs
         if input_ids is not None:
             input_ids = input_ids.to(self.device)
-            original_input_length = input_ids.shape[1]  # Track original input length
+            original_input_length = input_ids.shape[1]
         # If no input_ids provided, we need a prompt string
         elif prompt is not None:
             tokenized_input = tokenizer(prompt, return_tensors="pt")
             input_ids = tokenized_input.input_ids.to(self.device)
-            original_input_length = input_ids.shape[1]  # Track original input length
+            attention_mask = tokenized_input.attention_mask.to(self.device) if attention_mask is None else attention_mask
+            original_input_length = input_ids.shape[1]
         else:
             raise ValueError("Either 'input_ids' or 'prompt' keyword argument must be provided")
         
-        stop_token = tokenizer.eos_token
-        generation_trace = []
+        # Initialize proper attention mask if not provided
+        if attention_mask is None:
+            attention_mask = torch.ones_like(input_ids, device=self.device)
+        else:
+            attention_mask = attention_mask.to(self.device)
+        
+        # Setup for generation
+        eos_token_id = tokenizer.eos_token_id
         batch_size = input_ids.shape[0]
+        generation_trace = [[] for _ in range(batch_size)]
         
-        # Collect only the generated tokens, separate from input
-        generated_token_ids = [[] for _ in range(batch_size)]
-        
-        # Generate tokens one by one
-        for _ in range(max_new_tokens):
-            # Decode current sequence to text
+        # Initial input processing
+        with torch.no_grad():
+            # Process the initial input to get the first set of token logits and scores
             input_texts = [tokenizer.decode(input_ids[i], skip_special_tokens=False) for i in range(batch_size)]
-            
-            # Process through the model
             outputs = self(input_texts)
             token_logits = outputs["token_logits"]
             all_raw_scores = outputs["all_raw_scores"]
             
-            # Get model confidence at last token
+            # Get model confidence
             model_confidence = self.get_model_probs(all_raw_scores)
-            last_pos = model_confidence.shape[1] - 1
             
-            # Store next token for each item in batch
-            next_token_batch = []
-            decoded_tokens = []
-            best_model_ids = []
+            # Cache the best model for consecutive tokens (used with 'cached' strategy)
+            last_best_model_ids = [None] * batch_size
+            consecutive_use_count = [0] * batch_size
+            max_consecutive_use = 5  # Maximum number of consecutive tokens from the same model
             
-            for b in range(batch_size):
-                # Find best model for this batch item
-                best_model_idx = torch.argmax(model_confidence[b, last_pos]).item()
-                best_model_id = self.model_ids[best_model_idx]
-                best_model_ids.append(best_model_id)
+            # Initialize EOS flags for each batch item
+            eos_generated = [False] * batch_size
+            
+            # Generate tokens efficiently
+            for _ in range(max_new_tokens):
+                # Get positions in the sequence for next token prediction
+                last_pos = input_ids.shape[1] - 1  # Same for all batch items
                 
-                # Get logits from the chosen model at last position
-                logits = token_logits[best_model_id][b, -1, :]
+                # Store token selections for this step
+                next_token_ids = torch.zeros((batch_size, 1), dtype=torch.long, device=self.device)
+                best_model_ids = []
                 
-                # Temperature scaling
-                if temperature != 1.0:
-                    logits = logits / temperature
+                # Process each item in the batch
+                for b in range(batch_size):
+                    # Skip if we've already generated EOS for this batch item
+                    if eos_generated[b]:
+                        best_model_ids.append(last_best_model_ids[b] or self.model_ids[0])
+                        continue
                     
-                # Select next token
-                probs = torch.softmax(logits, dim=-1)
-                next_token_id = torch.argmax(probs).unsqueeze(0)
-                next_token_batch.append(next_token_id)
-                
-                # Add to our list of generated tokens
-                generated_token_ids[b].append(next_token_id.item())
-                
-                # Decode token if needed for stop condition checking
-                decoded_token = tokenizer.decode(next_token_id)
-                decoded_tokens.append(decoded_token)
-            
-            # Stack tokens for the batch and append to input_ids
-            next_tokens = torch.stack(next_token_batch).to(self.device)
-            input_ids = torch.cat([input_ids, next_tokens.view(batch_size, 1)], dim=1)
-            
-            # Track generation details
-            for b in range(batch_size):
-                if len(generation_trace) <= b:
-                    generation_trace.append([])
+                    # Determine which model to use for this token
+                    if model_selection_strategy == 'cached' and last_best_model_ids[b] and consecutive_use_count[b] < max_consecutive_use:
+                        # Use the cached best model
+                        best_model_id = last_best_model_ids[b]
+                        consecutive_use_count[b] += 1
+                    else:
+                        # Find best model based on confidence
+                        best_model_idx = torch.argmax(model_confidence[b, min(last_pos, model_confidence.shape[1]-1)]).item()
+                        best_model_id = self.model_ids[best_model_idx]
+                        last_best_model_ids[b] = best_model_id
+                        consecutive_use_count[b] = 1
                     
-                generation_trace[b].append({
-                    "token": decoded_tokens[b],
-                    "token_id": next_token_batch[b].item(),
-                    "model_id": best_model_ids[b]
-                })
+                    best_model_ids.append(best_model_id)
+                    
+                    # Get logits from chosen model
+                    logits = token_logits[best_model_id][b, -1, :].clone()
+                    
+                    # Apply temperature scaling and select next token
+                    if temperature > 0.0:
+                        # Temperature sampling
+                        scaled_logits = logits / temperature
+                        probs = torch.softmax(scaled_logits, dim=-1)
+                        # Sample from the distribution
+                        next_token_id = torch.multinomial(probs, num_samples=1)
+                    else:
+                        # Greedy decoding (argmax)
+                        next_token_id = torch.argmax(logits).view(1)
+                        
+                    next_token_ids[b, 0] = next_token_id
+                    
+                    # Check for EOS
+                    if next_token_id.item() == eos_token_id:
+                        eos_generated[b] = True
+                    
+                    # Add to generation trace
+                    decoded_token = tokenizer.decode(next_token_id)
+                    generation_trace[b].append({
+                        "token": decoded_token,
+                        "token_id": next_token_id.item(),
+                        "model_id": best_model_id
+                    })
                 
-                # Check for stop conditions per batch item
-                if stop_token in decoded_tokens[b]:
-                    # This would be more complex for true batch generation
-                    # Here we simplify by stopping all generation when batch[0] is done
-                    if b == 0:
-                        break
-                if next_token_batch[b].item() == tokenizer.eos_token_id:
-                    if b == 0:
-                        break
+                # Append new tokens to input_ids
+                input_ids = torch.cat([input_ids, next_token_ids], dim=1)
+                
+                # Extend attention mask
+                attention_mask = torch.cat([
+                    attention_mask, 
+                    torch.ones((batch_size, 1), device=self.device)
+                ], dim=1)
+                
+                # Check if all sequences have generated EOS or reached max length
+                if all(eos_generated) or input_ids.shape[1] >= 2048:  # Add a hard cap for safety
+                    break
+                
+                # For efficiency: only re-process if we have more tokens to generate
+                if _ < max_new_tokens - 1 and not all(eos_generated):
+                    # Re-process with newly generated tokens
+                    input_texts = [tokenizer.decode(input_ids[i], skip_special_tokens=False) for i in range(batch_size)]
+                    outputs = self(input_texts)
+                    token_logits = outputs["token_logits"]
+                    all_raw_scores = outputs["all_raw_scores"]
+                    model_confidence = self.get_model_probs(all_raw_scores)
         
-        # Convert generated token lists to tensors
-        generated_token_tensors = [torch.tensor(tokens).to(self.device) for tokens in generated_token_ids]
+        # Extract generated token IDs (excluding prompt)
+        generated_parts = [input_ids[b, original_input_length:] for b in range(batch_size)]
         
         # Prepare outputs based on return preferences
         if return_token_ids:
-            # Return only generated token IDs 
             if batch_size == 1:
                 if return_decisions:
                     return {
-                        "token_ids": generated_token_tensors[0],  # Return only generated tokens
+                        "token_ids": generated_parts[0],
                         "steps": generation_trace[0]
                     }
                 else:
-                    return generated_token_tensors[0]  # Return just the generated token tensor
+                    return generated_parts[0]
             else:
                 if return_decisions:
                     return [{
-                        "token_ids": generated_token_tensors[i],
+                        "token_ids": generated_parts[i],
                         "steps": generation_trace[i]
                     } for i in range(batch_size)]
                 else:
-                    return generated_token_tensors  # Return all batch generated token IDs
+                    return generated_parts
         else:
-            # Decode only the generated tokens as strings
-            generated_texts = []
-            for b in range(batch_size):
-                # Extract only the generated part (excluding prompt)
-                generated_part = input_ids[b, original_input_length:]
-                # Decode only the generated part
-                generated_text = tokenizer.decode(generated_part, skip_special_tokens=True)
-                generated_texts.append(generated_text)
+            # Decode generated tokens as strings
+            generated_texts = [tokenizer.decode(generated_parts[b], skip_special_tokens=True) for b in range(batch_size)]
             
             if batch_size == 1:
                 if return_decisions:
