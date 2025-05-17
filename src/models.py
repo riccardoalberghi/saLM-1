@@ -4,7 +4,7 @@ MODELS = [
     ModelInfo(
         id="LLama-3_2-1B-General-lora_model",
         name="Llama-3.2-1B General (LoRA)",
-        path="meta-llama/Llama-3.2-1B",
+        path="bunnycore/LLama-3.2-1B-General-lora_model",
         parameters=1_000_000_000,
         task="General-purpose text generation (LoRA adapter)"
     ),
