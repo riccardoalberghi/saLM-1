@@ -5,6 +5,7 @@ results/
 __pycache__/
 wandb/
 /model_outputs/
+/exp1/
 
 docs/
 notes.txt

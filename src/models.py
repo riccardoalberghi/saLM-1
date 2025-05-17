@@ -1,4 +1,4 @@
-from model_loader import ModelInfo
+from src.model_loader import ModelInfo
 
 MODELS = [
     ModelInfo(

@@ -288,79 +288,304 @@ class MultiModelWithScalarHeads(nn.Module):
 
     def generate(
         self,
-        prompt: str,
+        *args,
         max_new_tokens: int = 50,
         temperature: float = 1.0,
-        return_decisions: bool = True
-    ) -> str | Dict[str, any]:
+        return_decisions: bool = False,
+        return_token_ids: bool = True,  # New parameter to control output format
+        **kwargs  # Accept all standard generation parameters
+    ):
         """
-        Generate text from a prompt using model-wise confidence to select next token.
-        Optionally returns model decisions at each step.
+        Generate text using model-wise confidence to select next token.
+        Supports both string prompts and tokenized inputs.
+        Optionally returns model decisions at each step and/or raw token IDs.
 
         Args:
-            prompt (str): The input prompt/question.
             max_new_tokens (int): Max number of tokens to generate.
-            stop_token (Optional[str]): Optional string to stop early.
             temperature (float): Softmax temperature (1.0 = no scaling).
             return_decisions (bool): Whether to return a log of token + model at each step.
+            return_token_ids (bool): Whether to return token IDs instead of decoded text.
+            **kwargs: Additional generation parameters including:
+                - input_ids: Pre-tokenized input IDs
+                - attention_mask: Attention mask for the input
+                - prompt: Text prompt as an alternative to input_ids
 
         Returns:
-            Either a generated string or a dict with full trace if return_decisions=True.
+            Depending on parameters:
+            - If return_token_ids=True, return_decisions=False: Returns the tensor of token IDs
+            - If return_token_ids=True, return_decisions=True: Returns dict with token IDs and generation steps
+            - If return_token_ids=False, return_decisions=False: Returns decoded string
+            - If return_token_ids=False, return_decisions=True: Returns dict with decoded text and generation steps
         """
 
         self.eval()
-
         tokenizer = self.common_tokenizer
-        input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(self.device)
+        
+        # Extract inputs from kwargs
+        input_ids = kwargs.get('input_ids', None)
+        attention_mask = kwargs.get('attention_mask', None)
+        prompt = kwargs.get('prompt', None)
+        
+        # Handle already tokenized inputs
+        if input_ids is not None:
+            input_ids = input_ids.to(self.device)
+        # If no input_ids provided, we need a prompt string
+        elif prompt is not None:
+            input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(self.device)
+        else:
+            raise ValueError("Either 'input_ids' or 'prompt' keyword argument must be provided")
+        
         stop_token = tokenizer.eos_token
-
         generation_trace = []
-
+        batch_size = input_ids.shape[0]
+        
+        # Generate tokens one by one
         for _ in range(max_new_tokens):
-            input_text = tokenizer.decode(input_ids[0], skip_special_tokens=False)
-
-            outputs = self([input_text])
+            # Decode current sequence to text
+            input_texts = [tokenizer.decode(input_ids[i], skip_special_tokens=False) for i in range(batch_size)]
+            
+            # Process through the model
+            outputs = self(input_texts)
             token_logits = outputs["token_logits"]
             all_raw_scores = outputs["all_raw_scores"]
-
+            
             # Get model confidence at last token
             model_confidence = self.get_model_probs(all_raw_scores)
             last_pos = model_confidence.shape[1] - 1
-            best_model_idx = torch.argmax(model_confidence[0, last_pos]).item()
-            best_model_id = self.model_ids[best_model_idx]
-
-            # Get logits from the chosen model at last position
-            logits = token_logits[best_model_id][0, -1, :]
-
-            # Temperature scaling
-            if temperature != 1.0:
-                logits = logits / temperature
-
-            probs = torch.softmax(logits, dim=-1)
-            next_token_id = torch.argmax(probs).unsqueeze(0).unsqueeze(0).to(self.device)
-
-            # Append token
-            input_ids = torch.cat([input_ids, next_token_id], dim=1)
-
-            # Decode token and track model
-            decoded_token = tokenizer.decode(next_token_id[0])
-            generation_trace.append({
-                "token": decoded_token,
-                "token_id": next_token_id.item(),
-                "model_id": best_model_id
-            })
-
-            if stop_token and stop_token in decoded_token:
-                break
-            if next_token_id.item() == tokenizer.eos_token_id:
-                break
-
-        full_output = tokenizer.decode(input_ids[0], skip_special_tokens=True)
-
-        if return_decisions:
-            return {
-                "generated_text": full_output,
-                "steps": generation_trace
-            }
+            
+            # Store next token for each item in batch
+            next_token_batch = []
+            decoded_tokens = []
+            best_model_ids = []
+            
+            for b in range(batch_size):
+                # Find best model for this batch item
+                best_model_idx = torch.argmax(model_confidence[b, last_pos]).item()
+                best_model_id = self.model_ids[best_model_idx]
+                best_model_ids.append(best_model_id)
+                
+                # Get logits from the chosen model at last position
+                logits = token_logits[best_model_id][b, -1, :]
+                
+                # Temperature scaling
+                if temperature != 1.0:
+                    logits = logits / temperature
+                    
+                # Select next token
+                probs = torch.softmax(logits, dim=-1)
+                next_token_id = torch.argmax(probs).unsqueeze(0)
+                next_token_batch.append(next_token_id)
+                
+                # Decode token if needed for stop condition checking
+                decoded_token = tokenizer.decode(next_token_id)
+                decoded_tokens.append(decoded_token)
+            
+            # Stack tokens for the batch and append to input_ids
+            next_tokens = torch.stack(next_token_batch).to(self.device)
+            input_ids = torch.cat([input_ids, next_tokens.view(batch_size, 1)], dim=1)
+            
+            # Track generation details
+            for b in range(batch_size):
+                if len(generation_trace) <= b:
+                    generation_trace.append([])
+                    
+                generation_trace[b].append({
+                    "token": decoded_tokens[b],
+                    "token_id": next_token_batch[b].item(),
+                    "model_id": best_model_ids[b]
+                })
+                
+                # Check for stop conditions per batch item
+                if stop_token and stop_token in decoded_tokens[b]:
+                    # This would be more complex for true batch generation
+                    # Here we simplify by stopping all generation when batch[0] is done
+                    if b == 0:
+                        break
+                if next_token_batch[b].item() == tokenizer.eos_token_id:
+                    if b == 0:
+                        break
+        
+        # Prepare outputs based on return preferences
+        if return_token_ids:
+            # Return token IDs without decoding
+            if batch_size == 1:
+                if return_decisions:
+                    return {
+                        "token_ids": input_ids[0],  # Return as tensor
+                        "steps": generation_trace[0]
+                    }
+                else:
+                    return input_ids[0]  # Return just the tensor
+            else:
+                if return_decisions:
+                    return [{
+                        "token_ids": input_ids[i],
+                        "steps": generation_trace[i]
+                    } for i in range(batch_size)]
+                else:
+                    return input_ids  # Return all batch token IDs
         else:
-            return full_output
+            # Decode full outputs as strings (original behavior)
+            outputs = [tokenizer.decode(input_ids[i], skip_special_tokens=True) for i in range(batch_size)]
+            
+            if batch_size == 1:
+                if return_decisions:
+                    return {
+                        "generated_text": outputs[0],
+                        "steps": generation_trace[0]
+                    }
+                else:
+                    return outputs[0]
+            else:
+                if return_decisions:
+                    return [{
+                        "generated_text": outputs[i],
+                        "steps": generation_trace[i]
+                    } for i in range(batch_size)]
+                else:
+                    return outputs
+        
+    @classmethod
+    def from_pretrained(
+            cls,
+            base_models_info: List[ModelInfo],
+            weights_path: str,
+            head_hidden_dim: int = 256,
+            head_dropout: float = 0.1,
+            model_loader: Optional[ModelLoader] = None,
+            device: str = None,
+            dtype: torch.dtype = torch.float32
+        ):
+        """
+        Load a MultiModelWithScalarHeads model with pretrained projection head weights.
+
+        Args:
+            base_models_info: List of ModelInfo objects for the base models
+            weights_path: Path to the .pt file containing saved projection head weights
+            head_hidden_dim: Hidden dimension size for projection heads
+            head_dropout: Dropout rate for projection heads
+            model_loader: Optional custom ModelLoader instance
+            device: Device to load the model onto
+            dtype: Data type for model parameters
+            
+        Returns:
+            MultiModelWithScalarHeads: Loaded model with pretrained projection heads
+        """
+        import os
+        import torch
+
+        # Determine device if not provided
+        if device is None:
+            device = 'cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu'
+
+        print(f"Loading ensemble model on {device}...")
+
+        # Initialize the model with default (untrained) projection heads
+        model = cls(
+            base_models=base_models_info,
+            head_hidden_dim=head_hidden_dim,
+            head_dropout=head_dropout,
+            model_loader=model_loader,
+            device=device,
+            dtype=dtype
+        )
+
+        print("Model initialized. Loading projection head weights...")
+
+        # Load the saved projection head weights
+        if os.path.exists(weights_path):
+            print(f"Loading projection head weights from {weights_path}")
+            
+            # Load the state dict
+            state_dict = torch.load(weights_path, map_location=device)
+            
+            # Check if state_dict is a dictionary (it should be)
+            if not isinstance(state_dict, dict):
+                print(f"Warning: Expected dictionary from {weights_path}, got {type(state_dict)}. Skipping weight loading.")
+                return model
+                
+            # Analyze structure of the state dict to determine how to load it
+            # Check if it's a nested dictionary where keys are model_ids
+            if all(k in model.model_ids for k in state_dict.keys()) and all(isinstance(v, dict) for v in state_dict.values()):
+                # Nested structure: {model_id: head_state_dict}
+                print("Loading weights with structure: {model_id: head_state_dict}")
+                for model_id, head_state in state_dict.items():
+                    model.projection_heads[model_id].load_state_dict(head_state)
+                    
+            # Check if it's a flat dictionary with projection_heads prefix
+            elif any(k.startswith('projection_heads.') for k in state_dict.keys()):
+                # Flat structure: projection_heads module state_dict
+                print("Loading weights with structure: projection_heads module state_dict")
+                model.load_state_dict(state_dict, strict=False)
+                
+            # Check if it's a flat dictionary for just one projection head
+            elif any('weight' in k or 'bias' in k for k in state_dict.keys()):
+                # Try to determine if this belongs to a specific head
+                # For simplicity, we'll try to load into all heads
+                print("Loading weights as single head state_dict (trying for all heads)")
+                for model_id in model.model_ids:
+                    try:
+                        model.projection_heads[model_id].load_state_dict(state_dict, strict=False)
+                        print(f"  - Successfully loaded into head for {model_id}")
+                    except Exception as e:
+                        print(f"  - Failed to load into head for {model_id}: {e}")
+            
+            # If structure is different, try a flexible approach
+            else:
+                print("Attempting flexible weight loading")
+                # First, try loading directly with strict=False
+                try:
+                    model.load_state_dict(state_dict, strict=False)
+                    print("Successfully loaded weights with flexible mapping")
+                except Exception as e:
+                    print(f"Error in flexible loading: {e}")
+                    
+                    # Second attempt: Extract any keys that might match
+                    matching_keys = {}
+                    for k, v in state_dict.items():
+                        for model_id in model.model_ids:
+                            if model_id in k:
+                                new_key = f'projection_heads.{model_id}' + k[k.find(model_id) + len(model_id):]
+                                matching_keys[new_key] = v
+                    
+                    if matching_keys:
+                        try:
+                            model.load_state_dict(matching_keys, strict=False)
+                            print(f"Loaded {len(matching_keys)} matching weights with remapping")
+                        except Exception as e:
+                            print(f"Error in remapped loading: {e}")
+                    else:
+                        print("Warning: Could not match weights to model structure")
+                
+            print("Projection head weights loading attempts completed")
+        else:
+            print(f"Warning: Weights file {weights_path} does not exist. Using randomly initialized projection heads.")
+
+        # Set the model to evaluation mode
+        model.eval()
+
+        return model
+    
+    def save_projection_heads(self, save_path: str):
+        """
+        Save the projection heads to a specified path.
+
+        Args:
+            save_path (str): Path to save the projection heads.
+        """
+
+        import os
+        import torch
+        
+        # Create directory if it doesn't exist
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        
+        # Extract just the projection heads state dict
+        projection_heads_dict = {}
+        for name, param in self.state_dict().items():
+            if name.startswith('projection_heads.'):
+                projection_heads_dict[name] = param
+        
+        # Save to file
+        torch.save(projection_heads_dict, save_path)
+        print(f"Projection heads saved to {save_path}")
