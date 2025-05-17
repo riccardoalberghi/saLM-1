@@ -113,15 +113,17 @@ class MultiModelWithScalarHeads(nn.Module):
         # Move the entire model to the device
         self.to(self.device)    
     
-    def forward(self, input_texts: List[str]) -> Dict[str, torch.Tensor]:
+    def forward(self, input_texts: List[str], past_key_values: Dict[str, List] = None, use_cache: bool = False) -> Dict[str, torch.Tensor]:
         """
         Process input texts through all models and their projection heads.
 
         Args:
             input_texts: Input texts to process as a batch
+            past_key_values: Optional cached key-value pairs from previous forward passes
+            use_cache: Whether to use and return cached key-value pairs
 
         Returns:
-            Dictionary containing hidden states, raw scores, and model IDs
+            Dictionary containing hidden states, raw scores, model IDs, and optionally cached key-value pairs
         """
         if not isinstance(input_texts, list):
             input_texts = [input_texts]
@@ -130,6 +132,7 @@ class MultiModelWithScalarHeads(nn.Module):
         raw_model_scores   = {}
         token_logits       = {}
         seq_lens_per_model = {}
+        new_past_key_values = {} if use_cache else None
 
         #tokenize with the common tokenizer
         inputs = self.common_tokenizer(input_texts,
@@ -139,13 +142,30 @@ class MultiModelWithScalarHeads(nn.Module):
         # 1. Run every base model and collect its scores
         # -------------------------------------------------
         for model_id, model in self.base_models.items():
+            # Extract past key-values for this model if available
+            past_kv_for_model = None
+            if past_key_values is not None and model_id in past_key_values:
+                past_kv_for_model = past_key_values[model_id]
 
             # Freeze base model parameters
             with torch.no_grad():
-                outputs = model(**inputs, output_hidden_states=True)
+                # Pass past_key_values to model if available
+                model_inputs = {**inputs}
+                if past_kv_for_model is not None:
+                    model_inputs['past_key_values'] = past_kv_for_model
+                    
+                # Always request use_cache when available for efficiency
+                model_inputs['use_cache'] = use_cache
+                model_inputs['output_hidden_states'] = True
+                
+                outputs = model(**model_inputs)
 
             # Save logits (detached)
             token_logits[model_id] = outputs.logits.detach()
+
+            # Store key-value pairs if requested
+            if use_cache:
+                new_past_key_values[model_id] = outputs.past_key_values
 
             # Last‑layer hidden states: [B, L, H]
             last_hidden_state = outputs.hidden_states[-1].to(self.device).detach()
@@ -187,13 +207,19 @@ class MultiModelWithScalarHeads(nn.Module):
         )
         
         # Return results
-        return {
+        result = {
             "hidden_states": hidden_states,
             "raw_scores": raw_model_scores,
             "all_raw_scores": all_raw_model_scores,
             "token_logits": token_logits,
             "model_ids": self.model_ids
         }
+        
+        # Add past_key_values to the result if caching is used
+        if use_cache:
+            result["past_key_values"] = new_past_key_values
+            
+        return result
     
     def get_model_probs(self, all_raw_scores: torch.Tensor) -> torch.Tensor:
         """Convert raw scores to model probabilities using softmax."""
@@ -293,7 +319,6 @@ class MultiModelWithScalarHeads(nn.Module):
         temperature: float = 1.0,
         return_decisions: bool = False,
         return_token_ids: bool = True,
-        model_selection_strategy: str = "confidence",  # 'confidence' or 'cached'
         **kwargs  # Accept all standard generation parameters
     ):
         """
@@ -307,9 +332,6 @@ class MultiModelWithScalarHeads(nn.Module):
                 - If temperature>0: Uses sampling with temperature scaling (higher = more random)
             return_decisions (bool): Whether to return a log of token + model at each step.
             return_token_ids (bool): Whether to return token IDs instead of decoded text.
-            model_selection_strategy (str): Strategy for model selection:
-                - 'confidence': Select model with highest confidence score (default)
-                - 'cached': Use cached model selection for consecutive tokens
             **kwargs: Additional generation parameters including:
                 - input_ids: Pre-tokenized input IDs
                 - attention_mask: Attention mask for the input
@@ -356,19 +378,21 @@ class MultiModelWithScalarHeads(nn.Module):
         
         # Initial input processing
         with torch.no_grad():
+            # Initialize KV caching
+            past_key_values = None
+            
             # Process the initial input to get the first set of token logits and scores
             input_texts = [tokenizer.decode(input_ids[i], skip_special_tokens=False) for i in range(batch_size)]
-            outputs = self(input_texts)
+            outputs = self(input_texts, use_cache=True)
             token_logits = outputs["token_logits"]
             all_raw_scores = outputs["all_raw_scores"]
+            past_key_values = outputs["past_key_values"]  # Cache KV pairs for next forward pass
             
             # Get model confidence
             model_confidence = self.get_model_probs(all_raw_scores)
             
-            # Cache the best model for consecutive tokens (used with 'cached' strategy)
+            # Keep track of the best model IDs for generation trace
             last_best_model_ids = [None] * batch_size
-            consecutive_use_count = [0] * batch_size
-            max_consecutive_use = 5  # Maximum number of consecutive tokens from the same model
             
             # Initialize EOS flags for each batch item
             eos_generated = [False] * batch_size
@@ -389,17 +413,10 @@ class MultiModelWithScalarHeads(nn.Module):
                         best_model_ids.append(last_best_model_ids[b] or self.model_ids[0])
                         continue
                     
-                    # Determine which model to use for this token
-                    if model_selection_strategy == 'cached' and last_best_model_ids[b] and consecutive_use_count[b] < max_consecutive_use:
-                        # Use the cached best model
-                        best_model_id = last_best_model_ids[b]
-                        consecutive_use_count[b] += 1
-                    else:
-                        # Find best model based on confidence
-                        best_model_idx = torch.argmax(model_confidence[b, min(last_pos, model_confidence.shape[1]-1)]).item()
-                        best_model_id = self.model_ids[best_model_idx]
-                        last_best_model_ids[b] = best_model_id
-                        consecutive_use_count[b] = 1
+                    # Find best model based on confidence
+                    best_model_idx = torch.argmax(model_confidence[b, min(last_pos, model_confidence.shape[1]-1)]).item()
+                    best_model_id = self.model_ids[best_model_idx]
+                    last_best_model_ids[b] = best_model_id
                     
                     best_model_ids.append(best_model_id)
                     
@@ -446,11 +463,73 @@ class MultiModelWithScalarHeads(nn.Module):
                 
                 # For efficiency: only re-process if we have more tokens to generate
                 if _ < max_new_tokens - 1 and not all(eos_generated):
-                    # Re-process with newly generated tokens
-                    input_texts = [tokenizer.decode(input_ids[i], skip_special_tokens=False) for i in range(batch_size)]
-                    outputs = self(input_texts)
-                    token_logits = outputs["token_logits"]
-                    all_raw_scores = outputs["all_raw_scores"]
+                    # When using KV cache, we need a special handling for token IDs
+                    # The forward method expects text inputs, but we need to leverage the token IDs directly
+                    
+                    # Process with the existing tokenizer and models with KV caching
+                    # We'll create individual inputs for each model to properly use their KV caches
+                    new_token_logits = {}
+                    new_raw_scores = {}
+                    new_past_key_values = {}
+                    
+                    # Extract just the new token IDs (the last token for each batch item)
+                    new_input_ids = input_ids[:, -1:].to(self.device)
+                    
+                    # Process each model separately with its own KV cache
+                    for model_id, model in self.base_models.items():
+                        with torch.no_grad():
+                            # Get this model's past key-values
+                            model_past_kv = past_key_values.get(model_id, None)
+                            
+                            # Create a minimal input with just the token IDs and attention mask
+                            model_inputs = {
+                                'input_ids': new_input_ids,
+                                'attention_mask': torch.ones_like(new_input_ids, device=self.device),
+                                'past_key_values': model_past_kv,
+                                'use_cache': True,
+                                'output_hidden_states': True
+                            }
+                            
+                            # Process with the model
+                            outputs = model(**model_inputs)
+                            
+                            # Save the outputs
+                            new_token_logits[model_id] = outputs.logits.detach()
+                            new_past_key_values[model_id] = outputs.past_key_values
+                            
+                            # Process the projection head scores
+                            last_hidden_state = outputs.hidden_states[-1].detach()
+                            batch_size, seq_len, _ = last_hidden_state.shape
+                            
+                            position_scores = torch.zeros(batch_size, seq_len, device=self.device)
+                            for pos in range(seq_len):
+                                token_representation = last_hidden_state[:, pos, :]
+                                position_scores[:, pos] = (
+                                    self.projection_heads[model_id](token_representation)
+                                    .squeeze(-1)
+                                )
+                            
+                            new_raw_scores[model_id] = position_scores
+                    
+                    # Process the raw scores into the all_raw_scores format
+                    max_seq_len = max(scores.size(1) for scores in new_raw_scores.values())
+                    for model_id, scores in new_raw_scores.items():
+                        pad_len = max_seq_len - scores.size(1)
+                        if pad_len > 0:
+                            new_raw_scores[model_id] = torch.nn.functional.pad(
+                                scores, (0, pad_len), value=0.0
+                            )
+                    
+                    # Stack the raw scores
+                    new_all_raw_scores = torch.stack(
+                        [new_raw_scores[model_id] for model_id in self.model_ids],
+                        dim=-1
+                    )
+                    
+                    # Update with the new values
+                    token_logits = new_token_logits
+                    past_key_values = new_past_key_values
+                    all_raw_scores = new_all_raw_scores
                     model_confidence = self.get_model_probs(all_raw_scores)
         
         # Extract generated token IDs (excluding prompt)
