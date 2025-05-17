@@ -289,7 +289,7 @@ class MultiModelWithScalarHeads(nn.Module):
     def generate(
         self,
         *args,
-        max_new_tokens: int = 50,
+        max_new_tokens: int = 200,
         temperature: float = 1.0,
         return_decisions: bool = False,
         return_token_ids: bool = True,  # New parameter to control output format
@@ -312,9 +312,9 @@ class MultiModelWithScalarHeads(nn.Module):
 
         Returns:
             Depending on parameters:
-            - If return_token_ids=True, return_decisions=False: Returns the tensor of token IDs
+            - If return_token_ids=True, return_decisions=False: Returns the tensor of token IDs (only generated tokens)
             - If return_token_ids=True, return_decisions=True: Returns dict with token IDs and generation steps
-            - If return_token_ids=False, return_decisions=False: Returns decoded string
+            - If return_token_ids=False, return_decisions=False: Returns decoded string (only generated text)
             - If return_token_ids=False, return_decisions=True: Returns dict with decoded text and generation steps
         """
 
@@ -329,15 +329,21 @@ class MultiModelWithScalarHeads(nn.Module):
         # Handle already tokenized inputs
         if input_ids is not None:
             input_ids = input_ids.to(self.device)
+            original_input_length = input_ids.shape[1]  # Track original input length
         # If no input_ids provided, we need a prompt string
         elif prompt is not None:
-            input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(self.device)
+            tokenized_input = tokenizer(prompt, return_tensors="pt")
+            input_ids = tokenized_input.input_ids.to(self.device)
+            original_input_length = input_ids.shape[1]  # Track original input length
         else:
             raise ValueError("Either 'input_ids' or 'prompt' keyword argument must be provided")
         
         stop_token = tokenizer.eos_token
         generation_trace = []
         batch_size = input_ids.shape[0]
+        
+        # Collect only the generated tokens, separate from input
+        generated_token_ids = [[] for _ in range(batch_size)]
         
         # Generate tokens one by one
         for _ in range(max_new_tokens):
@@ -376,6 +382,9 @@ class MultiModelWithScalarHeads(nn.Module):
                 next_token_id = torch.argmax(probs).unsqueeze(0)
                 next_token_batch.append(next_token_id)
                 
+                # Add to our list of generated tokens
+                generated_token_ids[b].append(next_token_id.item())
+                
                 # Decode token if needed for stop condition checking
                 decoded_token = tokenizer.decode(next_token_id)
                 decoded_tokens.append(decoded_token)
@@ -396,7 +405,7 @@ class MultiModelWithScalarHeads(nn.Module):
                 })
                 
                 # Check for stop conditions per batch item
-                if stop_token and stop_token in decoded_tokens[b]:
+                if stop_token in decoded_tokens[b]:
                     # This would be more complex for true batch generation
                     # Here we simplify by stopping all generation when batch[0] is done
                     if b == 0:
@@ -405,45 +414,54 @@ class MultiModelWithScalarHeads(nn.Module):
                     if b == 0:
                         break
         
+        # Convert generated token lists to tensors
+        generated_token_tensors = [torch.tensor(tokens).to(self.device) for tokens in generated_token_ids]
+        
         # Prepare outputs based on return preferences
         if return_token_ids:
-            # Return token IDs without decoding
+            # Return only generated token IDs 
             if batch_size == 1:
                 if return_decisions:
                     return {
-                        "token_ids": input_ids[0],  # Return as tensor
+                        "token_ids": generated_token_tensors[0],  # Return only generated tokens
                         "steps": generation_trace[0]
                     }
                 else:
-                    return input_ids[0]  # Return just the tensor
+                    return generated_token_tensors[0]  # Return just the generated token tensor
             else:
                 if return_decisions:
                     return [{
-                        "token_ids": input_ids[i],
+                        "token_ids": generated_token_tensors[i],
                         "steps": generation_trace[i]
                     } for i in range(batch_size)]
                 else:
-                    return input_ids  # Return all batch token IDs
+                    return generated_token_tensors  # Return all batch generated token IDs
         else:
-            # Decode full outputs as strings (original behavior)
-            outputs = [tokenizer.decode(input_ids[i], skip_special_tokens=True) for i in range(batch_size)]
+            # Decode only the generated tokens as strings
+            generated_texts = []
+            for b in range(batch_size):
+                # Extract only the generated part (excluding prompt)
+                generated_part = input_ids[b, original_input_length:]
+                # Decode only the generated part
+                generated_text = tokenizer.decode(generated_part, skip_special_tokens=True)
+                generated_texts.append(generated_text)
             
             if batch_size == 1:
                 if return_decisions:
                     return {
-                        "generated_text": outputs[0],
+                        "generated_text": generated_texts[0],
                         "steps": generation_trace[0]
                     }
                 else:
-                    return outputs[0]
+                    return generated_texts[0]
             else:
                 if return_decisions:
                     return [{
-                        "generated_text": outputs[i],
+                        "generated_text": generated_texts[i],
                         "steps": generation_trace[i]
                     } for i in range(batch_size)]
                 else:
-                    return outputs
+                    return generated_texts
         
     @classmethod
     def from_pretrained(
