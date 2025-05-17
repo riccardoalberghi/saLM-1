@@ -15,4 +15,12 @@ MODELS = [
         parameters=1_000_000_000,
         task="Mathematical reasoning (GSM8K)"
     ),
+    ModelInfo(
+        id="Johhny1201/llama3.2_1b_med_QA_2",
+        name="Llama-3.2-1B med QA2",
+        path="Johhny1201/llama3.2_1b_med_QA_2",
+        parameters=1_000_000_000,
+        task="MedQA"
+    ),
+    
 ]
