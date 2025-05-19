@@ -52,8 +52,8 @@ def weighted_token_cross_entropy(
     # Update seq_len to reflect the aligned length
     # seq_len = effective_seq_len
     
-    # Initialize tensor for combined probabilities
-    combined_probs = torch.zeros(batch_size, seq_len, vocab_size, device=target_tokens.device, requires_grad=True)
+    # Initialize tensor for combined probabilities - no requires_grad needed as it will inherit gradients
+    combined_probs = torch.zeros(batch_size, seq_len, vocab_size, device=target_tokens.device)
     
     # Combine token probabilities with position-specific model weights
     for i, model_id in enumerate(model_ids):
@@ -63,8 +63,8 @@ def weighted_token_cross_entropy(
         # Only use required sequence length
         token_probs = token_probs_dict[model_id][:, :seq_len]
         
-        # Weight each model's token probabilities by its position-specific weight
-        combined_probs = combined_probs + model_weight * token_probs
+        # Weight each model's token probabilities by its position-specific weight - use in-place operation
+        combined_probs += model_weight * token_probs
     
     # Reshape for cross entropy calculation
     # From [batch_size, seq_len, vocab_size] to [batch_size * seq_len, vocab_size]
@@ -100,10 +100,104 @@ def weighted_token_cross_entropy(
         token_loss = torch.sum(combined_probs) * 0.0
     
     # Add entropy regularization - encourage diversity in model selection
-    # Calculate entropy at each token position and average
-    entropy = -torch.sum(model_probs * torch.log(model_probs + 1e-10), dim=2).mean()
+    # Calculate entropy at each token position, but only for non-padding tokens
+    entropy_per_position = -torch.sum(model_probs * torch.log(model_probs + 1e-10), dim=2)
+    
+    # Reshape target_tokens to match entropy dimensions
+    target_mask = (target_tokens.reshape(-1) != pad_token_id).view(batch_size, seq_len)
+    
+    # Apply mask and calculate mean entropy over valid positions
+    if target_mask.sum() > 0:
+        masked_entropy = (entropy_per_position * target_mask).sum() / target_mask.sum()
+    else:
+        masked_entropy = torch.tensor(0.0, device=token_loss.device)
     
     # Subtract entropy (with weight) from loss to encourage diverse model usage
-    total_loss = token_loss - entropy_weight * entropy
+    total_loss = token_loss - entropy_weight * masked_entropy
     
     return total_loss
+
+
+def perfect_alignment_loss(
+    token_logits: Dict[str, torch.Tensor],
+    model_probs: torch.Tensor,
+    labels: torch.Tensor,
+    ignore_index: int = -100,
+    entropy_weight: float = 0.1
+) -> torch.Tensor:
+    """
+    Loss function with perfect alignment between model outputs and labels.
+    
+    Args:
+        token_logits: Dictionary mapping model IDs to token logits [batch_size, seq_len, vocab_size]
+        model_probs: Routing probabilities [batch_size, seq_len, num_models]
+        labels: Target token IDs [batch_size, seq_len]
+        ignore_index: Token ID to ignore in loss calculation (usually -100)
+        entropy_weight: Weight for entropy regularization term
+    
+    Returns:
+        Loss value
+    """
+    batch_size, seq_len = labels.shape
+    vocab_size = next(iter(token_logits.values())).size(-1)
+    model_ids = list(token_logits.keys())
+    
+    # Convert token logits to probabilities
+    token_probs = {}
+    for model_id, logits in token_logits.items():
+        token_probs[model_id] = F.softmax(logits, dim=-1)
+    
+    # Combine token probabilities using routing weights
+    # Initialize with zeros, gradient tracking will come from operations
+    combined_probs = torch.zeros(batch_size, seq_len, vocab_size, device=labels.device)
+    
+    for i, model_id in enumerate(model_ids):
+        # Get model weight for each position [batch_size, seq_len, 1]
+        model_weight = model_probs[:, :, i].unsqueeze(-1)
+        
+        # Weight the token probabilities and add to combined - using in-place addition
+        combined_probs += model_weight * token_probs[model_id]
+    
+    # Convert to log probabilities for numerical stability
+    log_probs = torch.log(combined_probs + 1e-10)
+    
+    # Reshape for gathering
+    log_probs_flat = log_probs.view(-1, vocab_size)
+    labels_flat = labels.reshape(-1)
+    
+    # Create mask for non-ignored positions
+    non_ignore_mask = (labels_flat != ignore_index)
+    
+    # Calculate NLL loss only for non-ignored positions
+    nll_loss = F.nll_loss(
+        log_probs_flat,
+        labels_flat,
+        ignore_index=ignore_index,
+        reduction='none'
+    )
+    
+    # Apply mask and take mean, with safe guard if all positions are ignored
+    if non_ignore_mask.sum() > 0:
+        masked_loss = nll_loss[non_ignore_mask].mean()
+    else:
+        # If every position is ignored, return zero loss while keeping graph connectivity
+        masked_loss = torch.sum(log_probs) * 0.0
+    
+    # Add entropy regularization if requested
+    if entropy_weight > 0:
+        # Calculate entropy for routing probabilities
+        # Higher entropy = more balanced model usage
+        entropy = -torch.sum(model_probs * torch.log(model_probs + 1e-10), dim=-1)
+        
+        # Create 2D mask for non-ignored positions
+        labels_mask = (labels != ignore_index).float()
+        
+        # Apply mask to entropy and take mean
+        masked_entropy = (entropy * labels_mask).sum() / labels_mask.sum().clamp(min=1.0)
+        
+        # Subtract entropy from loss (higher entropy is better)
+        loss = masked_loss - entropy_weight * masked_entropy
+    else:
+        loss = masked_loss
+    
+    return loss

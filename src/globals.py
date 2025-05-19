@@ -1,3 +1,3 @@
 # GLOBAL variables
 
-MAX_LENGTH = 2048
+MAX_LENGTH = 256
