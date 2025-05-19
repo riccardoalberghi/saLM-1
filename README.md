@@ -1,6 +1,4 @@
-# NLP Multi-Model Architecture
-
-This repository implements a multi-model architecture that combines different specialized language models for improved performance across diverse tasks. By utilizing a mixture of experts approach with specialized models, the system can dynamically route queries to the most appropriate expert model.
+# SALME: Self-Aware Language Model Ensamble
 
 ## Overview
 
