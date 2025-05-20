@@ -1,4 +1,4 @@
-# saLM-1: Self-Aware Language Model Ensamble
+# saLM-1: Self-Aware Language Model Ensemble
 
 ## Overview
 
